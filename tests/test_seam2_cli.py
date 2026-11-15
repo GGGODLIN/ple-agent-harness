@@ -303,7 +303,7 @@ def test_pbt_p4_cli_export_and_ledger_safety_guardian(
     noise: str, score_a: float, unmeasured_b: bool, tok_in: int, tok_out: int, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
   case_dir = tmp_path_factory.mktemp("p4_seam2")
-  fake_sk, fake_hf, fake_ai = "sk-ple-cli-synth-77889900", "hf_pleCliSynthToken99887766", "AIzaSyPleCliSynthKey1234567890"
+  fake_sk, fake_hf, fake_ai = "sk-" + "ple-cli-synth-77889900", "hf_" + "pleCliSynthToken99887766", "AIza" + "SyPleCliSynthKey1234567890"
   dirty_blob = f"{noise}{fake_sk} Bearer {fake_hf} key={fake_ai}\nsecond_line"
 
   run_dir = case_dir / "run_one"
