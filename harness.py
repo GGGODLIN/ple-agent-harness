@@ -29,13 +29,18 @@ for Claude, GLM, GPT-6 and DeepSeek-V4, `high` for other models).
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
+from decimal import Decimal
 import json
 import os
 import posixpath
 import re
+import shlex
 import sys
 import types
 from typing import Any
+import uuid
 
 import openai
 import taskbridge
@@ -107,6 +112,87 @@ def redact_secrets(text: str) -> str:
   )
   redacted = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}\b", "[REDACTED]", redacted)
   return redacted
+
+
+STAGE2_RATES_PER_M: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {
+    "claude-opus-5-5": (Decimal("4.00"), Decimal("5.00"), Decimal("0.20"), Decimal("20.00")),
+    "gemini-4-argon": (Decimal("4.00"), Decimal("4.00"), Decimal("0.20"), Decimal("20.00")),
+    "gemini-3.8-flash": (Decimal("1.50"), Decimal("1.50"), Decimal("0.15"), Decimal("7.50")),
+    "gemini-3.1-pro-preview": (Decimal("2.00"), Decimal("2.00"), Decimal("0.20"), Decimal("12.00")),
+    "glm-5.2": (Decimal("1.40"), Decimal("1.40"), Decimal("0.14"), Decimal("4.40")),
+    "gemma-4-26b": (Decimal("0.15"), Decimal("0.15"), Decimal("0.015"), Decimal("0.60")),
+    "llama-4-maverick": (Decimal("0.35"), Decimal("0.35"), Decimal("0.35"), Decimal("1.15")),
+    "gpt-oss-120b": (Decimal("0.09"), Decimal("0.09"), Decimal("0.09"), Decimal("0.36")),
+}
+
+
+def _uget(obj: Any, name: str) -> Any:
+  if obj is None:
+    return None
+  if isinstance(obj, dict):
+    return obj.get(name)
+  val = getattr(obj, name, None)
+  if val is not None:
+    return val
+  extra = getattr(obj, "model_extra", None)
+  return extra.get(name) if isinstance(extra, dict) else None
+
+
+def normalize_usage(usage: Any) -> tuple[int, int, int, int]:
+  """Normalizes OpenAI or Anthropic usage into (uncached_input, cache_write, cache_read, output)."""
+  if usage is None:
+    return (0, 0, 0, 0)
+  prompt_tokens = _uget(usage, "prompt_tokens")
+  completion_tokens = _uget(usage, "completion_tokens")
+  input_tokens = _uget(usage, "input_tokens")
+  output_tokens = _uget(usage, "output_tokens")
+  cc_in = _uget(usage, "cache_creation_input_tokens")
+  cr_in = _uget(usage, "cache_read_input_tokens")
+  if input_tokens is not None and (prompt_tokens is None or cc_in is not None or cr_in is not None):
+    uncached = max(0, int(input_tokens or 0))
+    cache_write = max(0, int(cc_in or 0))
+    cache_read = max(0, int(cr_in or 0))
+    raw_out = output_tokens if output_tokens is not None else (completion_tokens or 0)
+    return (uncached, cache_write, cache_read, max(0, int(raw_out or 0)))
+  raw_p = max(0, int(prompt_tokens or 0))
+  details = _uget(usage, "prompt_tokens_details")
+  raw_cr = _uget(details, "cached_tokens")
+  if raw_cr is None:
+    raw_cr = _uget(usage, "cached_tokens")
+  raw_cw = _uget(details, "cache_write_tokens")
+  if raw_cw is None:
+    raw_cw = _uget(details, "cache_creation_tokens")
+  if raw_cw is None:
+    raw_cw = _uget(usage, "cache_write_tokens")
+  if raw_cw is None:
+    raw_cw = _uget(usage, "cache_creation_tokens")
+  cache_read = min(raw_p, max(0, int(raw_cr or 0)))
+  cache_write = min(raw_p - cache_read, max(0, int(raw_cw or 0)))
+  uncached = raw_p - cache_read - cache_write
+  raw_out = completion_tokens if completion_tokens is not None else (output_tokens or 0)
+  return (uncached, cache_write, cache_read, max(0, int(raw_out or 0)))
+
+
+def stage2_cost_usd(
+    model_name: str, uncached: int, cache_write: int, cache_read: int, output: int
+) -> Decimal:
+  """Computes January-2027 Stage-2 list cost in USD using exact Decimal arithmetic."""
+  tail = (model_name or "").strip().lower().rsplit("/", 1)[-1]
+  rates = STAGE2_RATES_PER_M.get(tail)
+  if rates is None:
+    return Decimal("0")
+  return (
+      Decimal(uncached) * rates[0]
+      + Decimal(cache_write) * rates[1]
+      + Decimal(cache_read) * rates[2]
+      + Decimal(output) * rates[3]
+  ) / Decimal(1_000_000)
+
+
+def _sanitize_rollup_str(text: str, limit: int = 500) -> str:
+  clean = redact_secrets(text or "")
+  clean = re.sub(r"[\x00-\x1f\x7f-\x9f  ]+", " ", clean).strip()
+  return redact_secrets(clean)[:limit]
 
 
 def _build_client() -> openai.AsyncOpenAI:
@@ -213,8 +299,9 @@ How to work:
 - Read the whole task, then look at the files you were given before choosing an approach.
 - Work in small, verified steps. Compute numbers with code rather than by hand, and check units.
 - When the task says how the result is checked (a time limit, a format, a test), check it that way yourself.
-- Write each deliverable exactly where, under the name and in the format the task asks for. Write it early, then \
-improve it.
+- Write each deliverable exactly where, under the name and in the format the task asks for. Author a valid baseline \
+early, then refine it: stage updates in same-directory ._ple_stage_* temporary files and promote with os.replace \
+(write_file and edit_file do this automatically).
 - Produce office and binary formats (docx, xlsx, pdf, ...) with code, such as python3 and the libraries in the \
 container, so they are real files of that format.
 - Before you finish, open every deliverable again and check that it is complete and readable.
@@ -907,6 +994,25 @@ class Agent:
     model_tail = self.model.lower().rsplit("/", 1)[-1]
     self.responses = model_tail.startswith(RESPONSES_MODELS)
     self.finish_margin = FINISH_MARGIN_SEC
+    self.session_tag = uuid.uuid4().hex[:12]
+    self.cmd_seq = 0
+    self.stage_seq = 0
+    self.delivered: dict[str, int] = {}
+    self.uncached_input_tokens = 0
+    self.cache_write_tokens = 0
+    self.cache_read_tokens = 0
+    self.output_tokens = 0
+    self.cost_usd = Decimal("0")
+    self.usage_emitted = 0
+
+  def _sync_final_message(self, prose: str = "") -> str:
+    prose = redact_secrets(prose)
+    manifest = "\n".join(f"{p} ({sz} bytes)" for p, sz in self.delivered.items())
+    if not prose:
+      return f"Delivered files:\n{manifest}" if manifest else redact_secrets(self.session.final_message)
+    if manifest and any(f"{p} ({sz} bytes)" not in prose for p, sz in self.delivered.items()):
+      return f"{prose}\n\nDelivered files:\n{manifest}"
+    return prose
 
   async def close(self) -> None:
     """Closes the underlying HTTP client."""
@@ -941,6 +1047,8 @@ class Agent:
     # head: the text of an answer cut off at the output limit
     nudges, head = 0, ""
     while True:
+      if self.session.cancelled.is_set():
+        raise taskbridge.Cancelled("cancelled")
       left = self.session.time_left()
       if left is not None and left < self.finish_margin:
         return await self.finish("Time is almost up.")
@@ -962,8 +1070,10 @@ class Agent:
         # message with null content and no tool calls.
         self.messages.append(reply.message())
       text = visible(head + reply.text)
-      if text:
-        self.session.final_message = text
+      if text and not reply.calls:
+        self.session.final_message = self._sync_final_message(text)
+      elif text and not self.delivered:
+        self.session.final_message = redact_secrets(text)
       if not reply.calls:
         if visible(reply.text) and reply.finish == "length":
           # cut off at the output limit: ask for the rest, and reset the
@@ -979,7 +1089,7 @@ class Agent:
           })
           continue
         if visible(reply.text) or nudges >= 2:
-          return text or self.session.final_message
+          return self.session.final_message or text
         nudges += 1  # only consecutive empty turns end the run
         self.messages.append({
             "role": "user",
@@ -991,6 +1101,8 @@ class Agent:
         continue
       nudges, head = 0, ""
       for call, args in zip(reply.calls.values(), arguments):
+        if self.session.cancelled.is_set():
+          raise taskbridge.Cancelled("cancelled")
         result = (
             await self.run_tool(call["name"], args)
             if isinstance(args, dict)
@@ -1041,7 +1153,9 @@ class Agent:
       )
     except (CutOff, openai.OpenAIError, OutOfTime, RuntimeError):
       text = ""
-    return text or self.session.final_message
+    if text:
+      self.session.final_message = self._sync_final_message(text)
+    return self.session.final_message or text
 
   async def connect_mcp(self) -> str:
     """Connects to the task's MCP servers and registers their tools.
@@ -1176,6 +1290,8 @@ class Agent:
     reserve = self.finish_margin if reserve is None else reserve
     waits = iter(RETRY_WAITS)
     while True:
+      if self.session.cancelled.is_set():
+        raise taskbridge.Cancelled("cancelled")
       try:
         reply = await self.stream(self.messages, tool_choice, reserve, head)
         if reply.finish is None:
@@ -1214,7 +1330,11 @@ class Agent:
       await self.session.log(
           f"model call failed ({safe_err[:300]}); again in {wait}s"
       )
-      await asyncio.sleep(wait)
+      try:
+        await asyncio.wait_for(self.session.cancelled.wait(), timeout=wait)
+        raise taskbridge.Cancelled("cancelled")
+      except asyncio.TimeoutError:
+        pass
 
   async def remedy(self, error: str) -> bool:
     """Adjusts request parameters for the next call after a bad request.
@@ -1296,6 +1416,8 @@ class Agent:
     Returns:
       `True` if `reasoning_effort` was being sent and is now dropped.
     """
+    if any(m.get("role") == "assistant" for m in self.messages):
+      return False
     if not self.effort or not re.search(r"reasoning[._]effort", error):
       return False
     self.effort = {}
@@ -1472,16 +1594,40 @@ class Agent:
         for part in delta.tool_calls or []:
           reply.add_call(part)
 
+    read_task = asyncio.create_task(read())
+    cancel_task = asyncio.create_task(self.session.cancelled.wait())
+    timeout = None if left is None else max(0.0, left - reserve)
     try:
-      await asyncio.wait_for(read(), None if left is None else left - reserve)
-    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-      if head is not None:
+      done, _ = await asyncio.wait(
+          {read_task, cancel_task},
+          timeout=timeout,
+          return_when=asyncio.FIRST_COMPLETED,
+      )
+      if cancel_task in done or self.session.cancelled.is_set():
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+          await read_task
+        if head or (head is not None and not self.delivered):
+          self.session.final_message = (
+              visible(head + reply.text) or self.session.final_message
+          )
+        raise taskbridge.Cancelled("cancelled")
+      if not done:
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+          await read_task
+        if head or (head is not None and not self.delivered):
+          self.session.final_message = (
+              visible(head + reply.text) or self.session.final_message
+          )
+        raise CutOff() from None
+      await read_task
+    except asyncio.CancelledError:
+      if head or (head is not None and not self.delivered):
         self.session.final_message = (
             visible(head + reply.text) or self.session.final_message
         )
-      if isinstance(exc, asyncio.CancelledError):
-        raise
-      raise CutOff() from None
+      raise
     except openai.APIError as exc:
       # the SDK raises an error sent inside a chat stream as an APIError
       said = {
@@ -1494,6 +1640,14 @@ class Agent:
       ):
         raise
       raise StreamBadRequest(said["message"]) from exc
+    finally:
+      cancel_task.cancel()
+      with contextlib.suppress(asyncio.CancelledError):
+        await cancel_task
+      if not read_task.done():
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+          await read_task
     for n, call in reply.calls.items():
       call["id"] = call["id"] or f"call_{n}_{len(self.messages)}"
       # some open models leak chat-template tokens into it
@@ -1579,43 +1733,52 @@ class Agent:
     if reply.usage is None:
       self.prompt_tokens = self.estimate_prompt_tokens()
       return
-    self.prompt_tokens = reply.usage.prompt_tokens or 0
+    uncached, cw, cr, _ = normalize_usage(reply.usage)
+    self.prompt_tokens = uncached + cw + cr
     await self.report(reply)
 
   async def report(self, reply: Reply) -> None:
-    """Reports token usage from `reply` to the evaluator session if present.
-
-    Args:
-      reply: Completed `Reply` whose `usage` should be reported.
-    """
-    usage = reply.usage
-    if usage is None:
+    """Reports normalized token usage and accumulates Stage-2 cost."""
+    if reply.usage is None:
       return
-    cached = (
-        getattr(
-            getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0
-        )
-        or 0
+    uncached, cw, cr, out = normalize_usage(reply.usage)
+    self.uncached_input_tokens += uncached
+    self.cache_write_tokens += cw
+    self.cache_read_tokens += cr
+    self.output_tokens += out
+    self.cost_usd += stage2_cost_usd(self.model, uncached, cw, cr, out)
+    self.usage_emitted += 1
+    await self.session.usage(self.model, uncached + cw + cr, out, cr)
+
+  async def emit_rollup(
+      self, status: str, summary: str = "", error: str = ""
+  ) -> None:
+    """Emits a single-line secret-redacted [PLE_ROLLUP] JSON log frame."""
+    total_in = (
+        self.uncached_input_tokens
+        + self.cache_write_tokens
+        + self.cache_read_tokens
     )
-    await self.session.usage(
-        self.model,
-        usage.prompt_tokens or 0,
-        usage.completion_tokens or 0,
-        cached,
-    )
+    payload = {
+        "status": _sanitize_rollup_str(status, 32),
+        "model": _sanitize_rollup_str(self.model, 128),
+        "uncached_input_tokens": self.uncached_input_tokens,
+        "cache_write_tokens": self.cache_write_tokens,
+        "cache_read_tokens": self.cache_read_tokens,
+        "output_tokens": self.output_tokens,
+        "input_tokens": total_in,
+        "cost_usd": round(float(self.cost_usd), 12),
+        "summary": _sanitize_rollup_str(summary, 400),
+        "error": _sanitize_rollup_str(error, 400),
+    }
+    line = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+    await self.session.log(f"[PLE_ROLLUP] {line}")
 
   async def run_tool(self, name: str, args: dict[str, Any]) -> str:
-    """Dispatches a tool call by `name` and returns its clipped text output.
-
-    Args:
-      name: Tool function name (`bash`, `read_file`, `write_file`, `edit_file`,
-        `mcp_find`, `mcp_call`, or a direct MCP tool name).
-      args: Parsed tool arguments dictionary.
-
-    Returns:
-      The tool output or error string.
-    """
-    await self.session.log(f"{name} {json.dumps(args)[:400]}")
+    """Dispatches a tool call by `name` and returns its clipped text output."""
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    await self.session.log(f"{name} {redact_secrets(json.dumps(args))[:400]}")
     try:
       if name == "mcp_call":
         name, args = str(args.get("tool", "")), args.get("arguments") or {}
@@ -1658,45 +1821,45 @@ class Agent:
     Returns:
       The resolved container path string.
     """
-    return (
+    raw = (
         path
         if path.startswith("/")
         else posixpath.join(self.session.workdir, path)
     )
+    return posixpath.normpath(raw)
 
   async def bash(self, command: str, timeout_sec: int = 120) -> str:
-    """Executes `command` with bash in the task container.
-
-    Args:
-      command: Shell command string to run.
-      timeout_sec: Timeout in seconds, cut to end before the time kept for the
-        final summary.
-
-    Returns:
-      Formatted exit code and command output string.
-    """
+    """Executes `command` with bash and tees full output into `/tmp/.ple_work_*`."""
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
     cap = int(self.session.limits.get("exec_timeout_sec") or 600)
     left = self.session.time_left()
     if left is not None:
       cap = min(cap, max(1, int(left - self.finish_margin)))
+    self.cmd_seq += 1
+    work_dir = f"/tmp/.ple_work_{self.session_tag}"
+    log_path = f"{work_dir}/cmd_{self.cmd_seq:04d}.log"
+    q_dir = shlex.quote(work_dir)
+    q_log = shlex.quote(log_path)
+    q_cmd = shlex.quote(command)
+    wrapped = (
+        f"mkdir -p -- {q_dir} && {{ bash -c {q_cmd} > {q_log} 2>&1;"
+        f" __ple_rc=$?; head -c 40000 {q_log};"
+        f" if [ $(wc -c < {q_log}) -gt 40000 ]; then"
+        " printf '\\n[... middle omitted ...]\\n';"
+        f" tail -c 10000 {q_log}; fi; exit $__ple_rc; }}"
+    )
     result = await self.session.exec(
-        command, taskbridge.positive_int(timeout_sec, 120, cap)
+        wrapped, taskbridge.positive_int(timeout_sec, 120, cap)
     )
     note = " (timed out)" if result.get("timed_out") else ""
-    return (
-        "exit code"
-        f" {result['exit_code']}{note}\n{result['output'] or '(no output)'}"
-    )
+    preview = clip(result["output"] or "(no output)", TOOL_RESULT_CHARS - 200)
+    return f"exit code {result['exit_code']}{note}\n{preview}\n[full_log: {log_path}]"
 
   async def read_file(self, path: str) -> str:
-    """Reads a UTF-8 text file from `path` in the task container.
-
-    Args:
-      path: File path inside the task container.
-
-    Returns:
-      Decoded file contents, or a notice if the file is binary or empty.
-    """
+    """Reads a UTF-8 text file from `path` in the task container."""
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
     data = await self.session.read_file(self.path(path))
     if b"\0" in data[:8192]:
       return (
@@ -1708,36 +1871,63 @@ class Agent:
   async def write_file(
       self, path: str, content: str, append: bool = False
   ) -> str:
-    """Writes or appends `content` to `path` in the task container.
-
-    Args:
-      path: Destination file path inside the task container.
-      content: Text content to write.
-      append: Whether to append to the file instead of overwriting.
-
-    Returns:
-      Confirmation string with the resulting file size in bytes.
-    """
-    size = await self.session.write_file(
-        self.path(path), content, append=bool(append)
+    """Atomically stages `content` via same-directory `._ple_stage_*` + `os.replace`."""
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    target = self.path(path)
+    payload = content.encode("utf-8")
+    if append:
+      res = await self.session.read_result(target)
+      if res.get("ok"):
+        if res.get("truncated"):
+          raise taskbridge.TaskError(
+              f"{path} is {res.get('size')} bytes, over the 10 MB read limit"
+          )
+        payload = base64.b64decode(res["content_b64"]) + payload
+      else:
+        err_l = str(res.get("error") or "").lower()
+        if not any(k in err_l for k in ("no such file", "not found", "enoent", "does not exist")):
+          raise taskbridge.TaskError(res.get("error"))
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    parent = posixpath.dirname(target) or "/"
+    self.stage_seq += 1
+    stage_path = posixpath.join(
+        parent, f"._ple_stage_{self.session_tag}_{self.stage_seq}"
     )
-    return f"{path} now holds {size} bytes"
+    q_stage = shlex.quote(stage_path)
+    q_target = shlex.quote(target)
+    try:
+      await self.session.write_file(stage_path, payload, append=False)
+    except taskbridge.TaskError:
+      if not self.session.cancelled.is_set():
+        with contextlib.suppress(taskbridge.TaskError):
+          await self.session.exec(f"rm -f -- {q_stage}", timeout_sec=15)
+      raise
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    promo = await self.session.exec(
+        "python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])'"
+        f" {q_stage} {q_target}",
+        timeout_sec=30,
+    )
+    if promo.get("exit_code", 1) != 0:
+      if not self.session.cancelled.is_set():
+        with contextlib.suppress(taskbridge.TaskError):
+          await self.session.exec(f"rm -f -- {q_stage}", timeout_sec=15)
+      raise taskbridge.TaskError(
+          promo.get("output") or f"failed to promote {stage_path} to {target}"
+      )
+    self.delivered[target] = len(payload)
+    self.session.final_message = self._sync_final_message()
+    return f"{path} now holds {len(payload)} bytes"
 
   async def edit_file(
       self, path: str, old_text: str, new_text: str, replace_all: bool = False
   ) -> str:
-    """Replaces `old_text` with `new_text` in `path` inside the task container.
-
-    Args:
-      path: Target file path inside the task container.
-      old_text: Substring to search for.
-      new_text: Replacement string.
-      replace_all: Whether to replace all occurrences instead of requiring one.
-
-    Returns:
-      Confirmation string or an error message if `old_text` is missing or
-      ambiguous.
-    """
+    """Replaces `old_text` with `new_text` in `path` via atomic staging."""
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
     text = (await self.session.read_file(self.path(path))).decode("utf-8")
     count = text.count(old_text) if old_text else 0
     if count == 0:
@@ -1747,8 +1937,8 @@ class Agent:
           f"error: old_text occurs {count} times in {path}; add context to make"
           " it unique, or set replace_all"
       )
-    await self.session.write_file(
-        self.path(path),
+    await self.write_file(
+        path,
         text.replace(old_text, new_text, -1 if replace_all else 1),
     )
     return f"replaced {count if replace_all else 1} occurrence(s) in {path}"
@@ -1886,14 +2076,7 @@ class Agent:
 
 
 async def solve(session: taskbridge.Session) -> str:
-  """Runs `Agent` on `session` and returns the final answer.
-
-  Args:
-    session: Active task session.
-
-  Returns:
-    The final summary string returned by the agent.
-  """
+  """Runs `Agent` on `session` and emits tail-pinned `[PLE_ROLLUP]` before exit."""
   agent = Agent(session)
   print(
       f"task: workdir {session.workdir}, model {agent.model},"
@@ -1901,7 +2084,37 @@ async def solve(session: taskbridge.Session) -> str:
       file=sys.stderr,
   )
   try:
-    return await agent.run()
+    answer = await agent.run()
+    if session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    if agent.usage_emitted == 0:
+      await session.usage(agent.model, 0, 0, 0)
+    final_ans = redact_secrets(
+        answer if isinstance(answer, str) and answer else session.final_message
+    )
+    session.final_message = final_ans
+    await agent.emit_rollup("done", summary=final_ans)
+    return final_ans
+  except (taskbridge.Cancelled, asyncio.CancelledError):
+    if agent.usage_emitted == 0:
+      await session.usage(agent.model, 0, 0, 0)
+    final_ans = redact_secrets(
+        session.final_message or "(stopped: time is up)"
+    )
+    session.final_message = final_ans
+    await agent.emit_rollup("cancelled", summary=final_ans)
+    return final_ans
+  except Exception as exc:
+    safe_err = redact_secrets(f"{type(exc).__name__}: {exc}")
+    if session.final_message:
+      safe_final = redact_secrets(session.final_message)
+      session.final_message = safe_final
+      print(f"harness error: {safe_err}", file=sys.stderr, flush=True)
+      await session.log(f"harness error after its summary: {safe_err}"[:2000])
+      await agent.emit_rollup("error", summary=safe_final, error=safe_err)
+      return safe_final
+    await agent.emit_rollup("error", summary="", error=safe_err)
+    raise RuntimeError(safe_err) from None
   finally:
     await agent.close()
 
