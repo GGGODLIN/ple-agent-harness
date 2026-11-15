@@ -34,6 +34,7 @@ import contextlib
 from decimal import Decimal
 import json
 import os
+from pathlib import Path
 import posixpath
 import re
 import shlex
@@ -42,9 +43,14 @@ import types
 from typing import Any
 import uuid
 
+import deliverable_audit
 import openai
 import taskbridge
 import urllib.parse
+
+_AUDIT_SCRIPT_B64 = base64.b64encode(
+    Path(deliverable_audit.__file__).read_bytes()
+).decode("ascii")
 
 MODEL = os.environ.get("MODEL_NAME", "")
 MAX_EFFORT_MODELS = ("claude", "glm", "gpt-6", "deepseek-v4")
@@ -303,12 +309,23 @@ How to work:
 early, then refine it: stage updates in same-directory ._ple_stage_* temporary files and promote with os.replace \
 (write_file and edit_file do this automatically).
 - Produce office and binary formats (docx, xlsx, pdf, ...) with code, such as python3 and the libraries in the \
-container, so they are real files of that format.
+container, so they are real files of that format. For new .xlsx workbooks, use XlsxWriter and pass both the formula \
+expression and precomputed value to write_formula so cached values exist immediately.
+- When multiple deliverables share calculated numbers, record canonical values in {work_dir}/facts.json and \
+verify every deliverable matches them.
+- On quantitative design or sizing tasks with a cost/performance objective, run a self-checked Python optimization \
+script (using scipy or catalog search with `assert` checks verifying both a nominal pass and a violated-constraint \
+failure) before finalizing.
 - Before you finish, open every deliverable again and check that it is complete and readable.
 - You have about {minutes} minutes in total; the time left is shown after the results of your tools.
 
 When the work is done, answer without calling a tool: a short summary of what you delivered (the path of each file) \
 and the key results. That answer is graded together with your files."""
+
+VERIFIER_SYSTEM = """You are an independent read-only engineering auditor. Using only bash and read_file, inspect the \
+produced deliverables in {workdir} against the task requirements (units, constraints, completeness, readability). Do \
+not modify any file. Reply starting with VERIFIER_PASS if every requirement is satisfied, or VERIFIER_FAIL: followed \
+by a concise numbered list of concrete defects."""
 
 MCP_DIRECT = """
 
@@ -1004,6 +1021,15 @@ class Agent:
     self.output_tokens = 0
     self.cost_usd = Decimal("0")
     self.usage_emitted = 0
+    self.audit_outcome = "not_run"
+    self.audit_repairs = 0
+    self.opt_rounds = 0
+    self.verifier_runs = 0
+    self.verifier_repairs = 0
+    self._workdir_dirty = False
+    self._needs_reaudit = False
+    self._audit_staged = False
+    self._has_self_checked_opt = False
 
   def _sync_final_message(self, prose: str = "") -> str:
     prose = redact_secrets(prose)
@@ -1038,6 +1064,7 @@ class Agent:
             "role": "system",
             "content": SYSTEM.format(
                 workdir=self.session.workdir,
+                work_dir=f"/tmp/.ple_work_{self.session_tag}",
                 mcp=mcp,
                 minutes=int(left / 60) if left else "unlimited",
             ),
@@ -1089,6 +1116,12 @@ class Agent:
           })
           continue
         if visible(reply.text) or nudges >= 2:
+          if visible(reply.text):
+            next_prompt = await self._post_completion_gate(text)
+            if next_prompt is not None:
+              nudges, head = 0, ""
+              self.messages.append({"role": "user", "content": next_prompt})
+              continue
           return self.session.final_message or text
         nudges += 1  # only consecutive empty turns end the run
         self.messages.append({
@@ -1263,6 +1296,8 @@ class Agent:
       tool_choice: str = "auto",
       reserve: float | None = None,
       head: str | None = None,
+      messages: list[dict[str, Any]] | None = None,
+      tools: list[dict[str, Any]] | None = None,
   ) -> Reply:
     """Streams one model completion with retries and context-limit recovery.
 
@@ -1293,10 +1328,19 @@ class Agent:
       if self.session.cancelled.is_set():
         raise taskbridge.Cancelled("cancelled")
       try:
-        reply = await self.stream(self.messages, tool_choice, reserve, head)
+        reply = await self.stream(
+            self.messages if messages is None else messages,
+            tool_choice,
+            reserve,
+            head,
+            tools=tools,
+        )
         if reply.finish is None:
           raise StreamCut("the stream ended without a finish reason")
+        saved_pt = self.prompt_tokens
         await self.record(reply)
+        if messages is not None:
+          self.prompt_tokens = saved_pt
         return reply
       except openai.APIStatusError as exc:
         if exc.status_code == 400 and await self.remedy(str(exc)):
@@ -1541,6 +1585,7 @@ class Agent:
       tool_choice: str,
       reserve: float,
       head: str | None = None,
+      tools: list[dict[str, Any]] | None = None,
   ) -> Reply:
     """Streams a single chat completion call up to `reserve` seconds before end.
 
@@ -1564,14 +1609,16 @@ class Agent:
     self.max_output = self.output_limit()
     reply = Reply()
 
+    active_tools = self.tools if tools is None else tools
+
     async def read():
       if self.responses:
-        await self.respond(reply, messages, tool_choice)
+        await self.respond(reply, messages, tool_choice, tools=active_tools)
         return
       stream = await self.client.chat.completions.create(
           model=self.model,
           messages=marked(messages, self.cache_mark),
-          tools=self.tools,
+          tools=active_tools,
           tool_choice=tool_choice,
           stream=True,
           stream_options={"include_usage": True},
@@ -1655,7 +1702,11 @@ class Agent:
     return reply
 
   async def respond(
-      self, reply: Reply, messages: list[dict[str, Any]], tool_choice: str
+      self,
+      reply: Reply,
+      messages: list[dict[str, Any]],
+      tool_choice: str,
+      tools: list[dict[str, Any]] | None = None,
   ) -> None:
     """Streams a single Responses API call into `reply`.
 
@@ -1675,12 +1726,13 @@ class Agent:
       StreamBadRequest: If the stream reports a non-retryable bad request.
     """
     effort = self.effort.get("reasoning_effort")
+    active_tools = self.tools if tools is None else tools
     stream = await self.client.responses.create(
         model=self.model,
         input=response_input(messages),
         tools=[
             {"type": "function", **t["function"], "strict": False}
-            for t in self.tools
+            for t in active_tools
         ],
         tool_choice=tool_choice,
         stream=True,
@@ -1768,6 +1820,9 @@ class Agent:
         "output_tokens": self.output_tokens,
         "input_tokens": total_in,
         "cost_usd": round(float(self.cost_usd), 12),
+        "audit_outcome": _sanitize_rollup_str(self.audit_outcome, 32),
+        "opt_rounds": self.opt_rounds,
+        "verifier_runs": self.verifier_runs,
         "summary": _sanitize_rollup_str(summary, 400),
         "error": _sanitize_rollup_str(error, 400),
     }
@@ -1828,10 +1883,158 @@ class Agent:
     )
     return posixpath.normpath(raw)
 
+  def _audit_bootstrap_cmd(self, work_dir: str) -> str:
+    q_dir = shlex.quote(work_dir)
+    audit_py = f"{work_dir}/deliverable_audit.py"
+    q_audit = shlex.quote(audit_py)
+    q_wdir = shlex.quote(self.session.workdir)
+    if self._audit_staged:
+      return f"python3 {q_audit} hook-pre {q_wdir} {q_dir} >/dev/null 2>&1 || true"
+    write_py = (
+        "import base64, pathlib; "
+        f"p = pathlib.Path({audit_py!r}); "
+        "p.exists() or p.write_bytes("
+        f"base64.b64decode({_AUDIT_SCRIPT_B64!r}))"
+    )
+    return (
+        f"{{ python3 -c {shlex.quote(write_py)} && python3 {q_audit} hook-pre"
+        f" {q_wdir} {q_dir}; }} >/dev/null 2>&1 || true"
+    )
+
+  async def audit_deliverables(self) -> list[str]:
+    """Runs Task-side deliverable audit and OOXML `<v>` patcher in `/tmp/.ple_work_*`."""
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    work_dir = f"/tmp/.ple_work_{self.session_tag}"
+    q_dir = shlex.quote(work_dir)
+    q_audit = shlex.quote(f"{work_dir}/deliverable_audit.py")
+    q_wdir = shlex.quote(self.session.workdir)
+    q_deliv = shlex.quote(json.dumps(list(self.delivered.keys())))
+    boot = self._audit_bootstrap_cmd(work_dir)
+    cmd = f"mkdir -p -- {q_dir} && {boot} && python3 {q_audit} audit {q_wdir} {q_dir} {q_deliv}"
+    res = await self.session.exec(cmd, timeout_sec=45)
+    self._audit_staged = True
+    out = res.get("output") or ""
+    marker = "__PLE_AUDIT_JSON__:"
+    idx = out.find(marker)
+    if idx < 0:
+      return []
+    data = json.loads(out[idx + len(marker) :].strip())
+    self.audit_outcome = str(data.get("outcome") or "pass")
+    self._needs_reaudit = False
+    for path_k, sz in (data.get("sizes") or {}).items():
+      if path_k in self.delivered:
+        self.delivered[path_k] = int(sz)
+    findings = [str(x) for x in (data.get("findings") or [])]
+    detail = "; ".join(findings)[:800] if findings else "ok"
+    await self.session.log(f"[PLE_AUDIT] {self.audit_outcome}: {redact_secrets(detail)}")
+    return findings
+
+  async def run_verifier(self, candidate_text: str) -> str | None:
+    """Runs a single clean-context read-only `VERIFIER` audit using `TOOLS[:2]`."""
+    self.verifier_runs += 1
+    v_tools = list(TOOLS[:2])
+    v_messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": VERIFIER_SYSTEM.format(workdir=self.session.workdir),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Task instruction:\n{self.session.instruction}\n\n"
+                f"Candidate summary:\n{candidate_text}"
+            ),
+        },
+    ]
+    for _ in range(4):
+      if self.session.cancelled.is_set():
+        raise taskbridge.Cancelled("cancelled")
+      left = self.session.time_left()
+      if left is not None and left < self.finish_margin:
+        return None
+      v_reply = await self.complete(messages=v_messages, tools=v_tools)
+      if not v_reply.calls:
+        return visible(v_reply.text)
+      v_args = [parse_arguments(c) for c in v_reply.calls.values()]
+      v_messages.append(v_reply.message())
+      saved_dirty = self._needs_reaudit
+      for call, args in zip(v_reply.calls.values(), v_args):
+        if call["name"] not in ("bash", "read_file"):
+          result = "error: verifier is strictly read-only"
+        elif isinstance(args, dict):
+          result = await self.run_tool(call["name"], args)
+        else:
+          result = args
+        v_messages.append(
+            {"role": "tool", "tool_call_id": call["id"], "content": result}
+        )
+      self._needs_reaudit = saved_dirty
+    return None
+
+  async def _post_completion_gate(self, text: str) -> str | None:
+    if self.session.cancelled.is_set():
+      raise taskbridge.Cancelled("cancelled")
+    should_audit = (bool(self.delivered) or self._workdir_dirty) and self._needs_reaudit
+    left = self.session.time_left()
+    if left is not None and left < self.finish_margin * 1.5:
+      if should_audit:
+        await self.audit_deliverables()
+      return None
+    if should_audit:
+      findings = await self.audit_deliverables()
+      self.session.final_message = self._sync_final_message(text)
+      if findings and self.audit_repairs < 1:
+        self.audit_repairs += 1
+        bullets = "\n".join(f"- {item}" for item in findings[:10])
+        return (
+            "Deliverable audit flagged issues that must be fixed before"
+            f" finishing:\n{bullets}\nRepair the deliverables, re-verify"
+            " consistency, and provide your updated final summary."
+        )
+    max_opt = min(3, max(0, int(os.environ.get("PLE_MAX_OPT_ROUNDS", "3") or "3")))
+    if (
+        deliverable_audit.is_quantitative_optimization_task(
+            self.session.instruction
+        )
+        and self.opt_rounds < max_opt
+    ):
+      if not (self._has_self_checked_opt and "OPTIMIZATION_CONVERGED" in text):
+        self.opt_rounds += 1
+        return (
+            f"Optimization pass ({self.opt_rounds}/{max_opt}): Run a"
+            " self-checked Python optimization script (include `assert` checks"
+            " verifying both a nominal feasible design pass and a"
+            " violated-constraint failure) using scipy or catalog search to"
+            " improve the objective within all constraints. Stage improved"
+            " deliverables via ._ple_stage_* + os.replace, or reply"
+            " OPTIMIZATION_CONVERGED with your final summary once certified"
+            " optimal."
+        )
+    if (
+        os.environ.get("PLE_ENABLE_VERIFIER", "0").strip() == "1"
+        and self.verifier_runs == 0
+    ):
+      verdict = await self.run_verifier(text)
+      if (
+          verdict
+          and not verdict.lstrip().upper().startswith("VERIFIER_PASS")
+          and self.verifier_repairs < 1
+      ):
+        self.verifier_repairs += 1
+        return (
+            "Clean-context read-only VERIFIER audit found gaps (1 targeted"
+            f" repair pass):\n{verdict}\nFix these gaps in the deliverables"
+            " and provide your updated final summary."
+        )
+    return None
+
   async def bash(self, command: str, timeout_sec: int = 120) -> str:
     """Executes `command` with bash and tees full output into `/tmp/.ple_work_*`."""
     if self.session.cancelled.is_set():
       raise taskbridge.Cancelled("cancelled")
+    if "assert" in command:
+      self._has_self_checked_opt = True
     cap = int(self.session.limits.get("exec_timeout_sec") or 600)
     left = self.session.time_left()
     if left is not None:
@@ -1842,18 +2045,29 @@ class Agent:
     q_dir = shlex.quote(work_dir)
     q_log = shlex.quote(log_path)
     q_cmd = shlex.quote(command)
+    q_audit = shlex.quote(f"{work_dir}/deliverable_audit.py")
+    q_wdir = shlex.quote(self.session.workdir)
+    pre_hook = self._audit_bootstrap_cmd(work_dir)
     wrapped = (
-        f"mkdir -p -- {q_dir} && {{ bash -c {q_cmd} > {q_log} 2>&1;"
+        f"mkdir -p -- {q_dir} && {pre_hook} && {{ PLE_WORK_DIR={q_dir} bash -c {q_cmd} > {q_log} 2>&1;"
         f" __ple_rc=$?; head -c 40000 {q_log};"
         f" if [ $(wc -c < {q_log}) -gt 40000 ]; then"
         " printf '\\n[... middle omitted ...]\\n';"
-        f" tail -c 10000 {q_log}; fi; exit $__ple_rc; }}"
+        f" tail -c 10000 {q_log}; fi;"
+        f" python3 {q_audit} hook-post {q_wdir} {q_dir} 2>/dev/null || true;"
+        " exit $__ple_rc; }"
     )
     result = await self.session.exec(
         wrapped, taskbridge.positive_int(timeout_sec, 120, cap)
     )
+    self._audit_staged = True
+    raw_out = result["output"] or ""
+    if raw_out.endswith("\n__PLE_DIRTY__"):
+      raw_out = raw_out[: -len("\n__PLE_DIRTY__")]
+      self._workdir_dirty = True
+      self._needs_reaudit = True
     note = " (timed out)" if result.get("timed_out") else ""
-    preview = clip(result["output"] or "(no output)", TOOL_RESULT_CHARS - 200)
+    preview = clip(raw_out or "(no output)", TOOL_RESULT_CHARS - 200)
     return f"exit code {result['exit_code']}{note}\n{preview}\n[full_log: {log_path}]"
 
   async def read_file(self, path: str) -> str:
@@ -1919,6 +2133,7 @@ class Agent:
           promo.get("output") or f"failed to promote {stage_path} to {target}"
       )
     self.delivered[target] = len(payload)
+    self._needs_reaudit = True
     self.session.final_message = self._sync_final_message()
     return f"{path} now holds {len(payload)} bytes"
 
