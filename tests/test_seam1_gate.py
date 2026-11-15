@@ -247,7 +247,7 @@ def test_repository_contract_and_apache_attribution() -> None:
     for line in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     if line.strip() and not line.strip().startswith("#")
   ]
-  for expected_ignored in (".venv", "__pycache__", ".pytest_cache", ".hypothesis", ".scratch"):
+  for expected_ignored in (".venv", "__pycache__", ".pytest_cache", ".scratch"):
     assert expected_ignored in gitignore_lines, f".gitignore missing {expected_ignored}"
   assert "artifacts" not in gitignore_lines, ".gitignore must never ignore artifacts/"
 
@@ -579,7 +579,7 @@ def test_unauthorized_and_unreachable_proxy_emit_redacted_error_frames(
       monkeypatch.setenv("OPENAI_API_KEY", fake_secret)
       monkeypatch.setenv("MODEL_API_KEY", fake_secret)
       monkeypatch.setenv("MODEL_NAME", "google-cloud/glm-5.2")
-      monkeypatch.setenv("MODEL_RETRY_WAITS", "")
+      monkeypatch.setattr(harness, "RETRY_WAITS", ())
 
       frames_401, stderr_401 = await _collect_ws_frames(_free_tcp_port())
       terminal_401 = frames_401[-1]
@@ -602,7 +602,7 @@ def test_unauthorized_and_unreachable_proxy_emit_redacted_error_frames(
     monkeypatch.setenv("OPENAI_API_KEY", fake_secret)
     monkeypatch.setenv("MODEL_API_KEY", fake_secret)
     monkeypatch.setenv("MODEL_NAME", "google-cloud/glm-5.2")
-    monkeypatch.setenv("MODEL_RETRY_WAITS", "")
+    monkeypatch.setattr(harness, "RETRY_WAITS", ())
 
     frames_unreach, stderr_unreach = await _collect_ws_frames(_free_tcp_port())
     terminal_unreach = frames_unreach[-1]

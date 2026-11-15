@@ -109,15 +109,6 @@ def redact_secrets(text: str) -> str:
   return redacted
 
 
-def _resolve_retry_waits() -> tuple[float, ...]:
-  raw = os.environ.get("MODEL_RETRY_WAITS")
-  if raw is None:
-    return RETRY_WAITS
-  if not raw.strip():
-    return ()
-  return tuple(float(part.strip()) for part in raw.split(",") if part.strip())
-
-
 def _build_client() -> openai.AsyncOpenAI:
   base_url = (
       os.environ.get("MODEL_BASE_URL")
@@ -894,7 +885,6 @@ class Agent:
     self.model = os.environ.get("MODEL_NAME", MODEL)
     self.cache_mark = "claude" in self.model.lower()
     self.compact_at_tokens = int(os.environ.get("COMPACT_AT_TOKENS", "150000"))
-    self.retry_waits = _resolve_retry_waits()
     self.client = _build_client()
     self.tools = list(TOOLS)
     self.mcp: dict[str, tuple[MCPServer, dict[str, Any]]] = {}
@@ -1037,11 +1027,12 @@ class Agent:
         ),
     })
     left = self.session.time_left()
-    # the summary call gets taskbridge.time_share(left, 30) seconds, and at
-    # least 5
-    reserve = (
-        0 if left is None else left - max(5, taskbridge.time_share(left, 30))
-    )
+    if left is None:
+      reserve = 0.0
+    else:
+      bounded = max(left, 0.0)
+      share = bounded - min(30.0, bounded * 0.25)
+      reserve = left - max(5.0, share)
     try:
       text = visible(
           (
@@ -1183,7 +1174,7 @@ class Agent:
         reason.
     """
     reserve = self.finish_margin if reserve is None else reserve
-    waits = iter(self.retry_waits)
+    waits = iter(RETRY_WAITS)
     while True:
       try:
         reply = await self.stream(self.messages, tool_choice, reserve, head)
