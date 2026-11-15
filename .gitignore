@@ -1,0 +1,10 @@
+.scratch/
+.venv/
+__pycache__/
+*.py[cod]
+*.env
+.env*
+runs/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
