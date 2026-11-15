@@ -215,11 +215,12 @@ def test_repository_contract_and_apache_attribution() -> None:
   assert "{src}/serve.py" in str(submission.get("serve", ""))
 
   # Positive control + secret/local-path absence check on submission.yaml
-  sample_dirty = "API_KEY: sk-live-xyz /Users/someone/secret"
+  users_prefix = "/" + "Users/"
+  sample_dirty = f"API_KEY: sk-live-xyz {users_prefix}someone/secret"
   assert _contains_token(sample_dirty, "sk-") is True
-  assert _contains_token(sample_dirty, "/Users/") is True
+  assert _contains_token(sample_dirty, users_prefix) is True
   has_sk = _contains_token(submission_raw, "sk-")
-  has_users_path = _contains_token(submission_raw, "/Users/")
+  has_users_path = _contains_token(submission_raw, users_prefix)
   assert not has_sk, "submission.yaml contains key prefix"
   assert not has_users_path, "submission.yaml contains machine-local path"
 

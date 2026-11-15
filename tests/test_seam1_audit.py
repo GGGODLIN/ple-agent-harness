@@ -175,7 +175,7 @@ def test_permissive_dependency_manifests_and_system_guidance(tmp_path: Path) -> 
   assert _has_copyleft_ref("PyMuPDF==1.24.0\nformulas==1.2.8\nimport fitz") is True
   reqs_text = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
   reqs_set = {ln.strip() for ln in reqs_text.splitlines() if ln.strip() and not ln.strip().startswith("#")}
-  assert reqs_set == {"openai==3.26.1", "websockets==15.0.1", "XlsxWriter==3.3.1", "openpyxl==3.1.5", "python-docx==1.2.0", "pdfplumber==0.11.10", "scipy==1.18.1", "pint==0.26.2"}
+  assert reqs_set == {"openai==3.26.1", "websockets==15.0.1", "XlsxWriter==3.3.1", "openpyxl==3.1.5", "python-docx==1.2.0", "pdfplumber==0.11.10", "scipy==1.17.1", "pint==0.25.2"}
   repo_sources = "\n".join(p.read_text(encoding="utf-8") for p in sorted(REPO_ROOT.glob("*.py")) + [REPO_ROOT / "requirements.txt", REPO_ROOT / "submission.yaml"])
   has_banned = _has_copyleft_ref(repo_sources)
   assert not has_banned, "copyleft package referenced in manifests or harness code"
