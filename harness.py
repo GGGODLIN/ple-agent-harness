@@ -11,19 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified from google-research/ple (Apache-2.0)
 
 """Tool-calling harness for any OpenAI-compatible model endpoint.
 
-Connects to `MODEL_BASE_URL` using `MODEL_API_KEY` and `MODEL_NAME`. The model
-works in the task container through four built-in tools (`bash`, `read_file`,
-`write_file`, `edit_file`) plus the task's own MCP tools, and finishes when it
-provides a complete answer without calling a tool. That answer becomes the final
-message. Calls go to the Chat Completions API, or to the Responses API for
-OpenAI's GPT-6 models (`RESPONSES_MODELS`).
+Connects to `MODEL_BASE_URL` (falling back to `MODEL_PROXY_URL` or
+`OPENAI_BASE_URL`) using `MODEL_API_KEY` (falling back to `MODEL_PROXY_KEY` or
+`OPENAI_API_KEY`) and `MODEL_NAME`. The model works in the task container
+through four built-in tools (`bash`, `read_file`, `write_file`, `edit_file`)
+plus the task's own MCP tools, and finishes when it provides a complete answer
+without calling a tool. That answer becomes the final message. Calls go to the
+Chat Completions API, or to the Responses API for OpenAI's GPT-6 models
+(`RESPONSES_MODELS`).
 
 Optional environment variables: `MAX_OUTPUT_TOKENS` (default `32000`),
 `COMPACT_AT_TOKENS` (default `150000`), and `REASONING_EFFORT` (default `max`
-for Claude, GLM, GPT-6 and DeepSeek-V4, `high` for other models).
+for Claude, GLM, GPT-6 and DeepSeek-V4, omitted for Gemma and Llama, and `high`
+for other models).
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ import taskbridge
 import urllib.parse
 
 _AUDIT_SCRIPT_B64 = base64.b64encode(
-    Path(deliverable_audit.__file__).read_bytes()
+    Path(__file__).with_name("deliverable_audit.py").read_bytes()
 ).decode("ascii")
 
 MODEL = os.environ.get("MODEL_NAME", "")
@@ -59,11 +63,44 @@ SECRET_ENV_VARS = (
     "MODEL_API_KEY",
     "MODEL_PROXY_KEY",
     "OPENAI_API_KEY",
+    "JUDGE_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "HF_TOKEN",
 )
-URL_ENV_VARS = ("MODEL_BASE_URL", "MODEL_PROXY_URL", "OPENAI_BASE_URL")
+URL_ENV_VARS = (
+    "MODEL_BASE_URL",
+    "MODEL_PROXY_URL",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_BASE_URL",
+    "GOOGLE_GEMINI_BASE_URL",
+)
+_SECRET_PATTERNS = (
+    (re.compile(r"(https?://)([^/\s@]+)@"), r"\1[REDACTED]@"),
+    (re.compile(r'([?&](?:api_?key|key|token|access_token)=)[^&#\s"\']+', re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-+/=:~]{4,}"), r"\1[REDACTED]"),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+            r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+        ),
+        "[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])(?:"
+            r"sk-[A-Za-z0-9_\-]{8,}"
+            r"|AIza[A-Za-z0-9_\-]{16,}"
+            r"|hf_[A-Za-z0-9_\-]{16,}"
+            r"|gh[pousr]_[A-Za-z0-9_]{16,}"
+            r"|github_pat_[A-Za-z0-9_]{16,}"
+            r"|AKIA[0-9A-Z]{16}"
+            r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+            r")"
+        ),
+        "[REDACTED]",
+    ),
+)
 
 
 def resolve_reasoning_effort(
@@ -98,10 +135,21 @@ def _collect_secret_values() -> list[str]:
       parsed = urllib.parse.urlsplit(raw_url)
     except ValueError:
       continue
-    if parsed.password:
-      found.add(parsed.password)
-    if parsed.username and parsed.password:
-      found.add(f"{parsed.username}:{parsed.password}")
+    user = parsed.username or ""
+    pwd = parsed.password or ""
+    unq_user = urllib.parse.unquote(user) if user else ""
+    unq_pwd = urllib.parse.unquote(pwd) if pwd else ""
+    for item in (user, unq_user, pwd, unq_pwd):
+      if len(item) >= 4 and item.lower() not in {"none", "null", "empty"}:
+        found.add(item)
+    if user and pwd:
+      found.add(f"{user}:{pwd}")
+      found.add(f"{unq_user}:{unq_pwd}")
+    for qk, qvals in urllib.parse.parse_qs(parsed.query).items():
+      if qk.lower() in {"api_key", "apikey", "key", "token", "access_token"}:
+        for qv in qvals:
+          if len(qv) >= 4:
+            found.add(qv)
   return sorted(found, key=len, reverse=True)
 
 
@@ -112,11 +160,8 @@ def redact_secrets(text: str) -> str:
   redacted = text
   for secret in _collect_secret_values():
     redacted = redacted.replace(secret, "[REDACTED]")
-  redacted = re.sub(r"(https?://)([^/\s@]+)@", r"\1[REDACTED]@", redacted)
-  redacted = re.sub(
-      r"(?i)(bearer\s+)[A-Za-z0-9._\-]{4,}", r"\1[REDACTED]", redacted
-  )
-  redacted = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}\b", "[REDACTED]", redacted)
+  for pat, repl in _SECRET_PATTERNS:
+    redacted = pat.sub(repl, redacted)
   return redacted
 
 
@@ -165,6 +210,8 @@ def normalize_usage(usage: Any) -> tuple[int, int, int, int]:
   raw_cr = _uget(details, "cached_tokens")
   if raw_cr is None:
     raw_cr = _uget(usage, "cached_tokens")
+  if raw_cr is None:
+    raw_cr = cr_in
   raw_cw = _uget(details, "cache_write_tokens")
   if raw_cw is None:
     raw_cw = _uget(details, "cache_creation_tokens")
@@ -172,6 +219,8 @@ def normalize_usage(usage: Any) -> tuple[int, int, int, int]:
     raw_cw = _uget(usage, "cache_write_tokens")
   if raw_cw is None:
     raw_cw = _uget(usage, "cache_creation_tokens")
+  if raw_cw is None:
+    raw_cw = cc_in
   cache_read = min(raw_p, max(0, int(raw_cr or 0)))
   cache_write = min(raw_p - cache_read, max(0, int(raw_cw or 0)))
   uncached = raw_p - cache_read - cache_write
@@ -221,7 +270,6 @@ def _build_client() -> openai.AsyncOpenAI:
   )
 
 
-EFFORT = resolve_reasoning_effort(MODEL, os.environ.get("REASONING_EFFORT"))
 # OpenAI's GPT-6 models only support function tools combined with
 # reasoning_effort on the Responses API. Other models also switch to
 # /v1/responses if /v1/chat/completions returns a 400 directing them there.
@@ -232,7 +280,6 @@ RESPONSES_ONLY = re.compile(
 # Claude reuses a cached prompt prefix only where a request marks one
 # (marked()); other models cache on their own.
 CACHE_MARK = "claude" in MODEL.lower()
-COMPACT_AT_TOKENS = int(os.environ.get("COMPACT_AT_TOKENS", "150000"))
 TOOL_RESULT_CHARS = 30_000
 # MCP tools are offered as functions up to this many characters of JSON in all
 DIRECT_MCP_CHARS = 40_000
@@ -296,8 +343,6 @@ DELTA_FIELDS = {
     "reasoning",
 }
 
-client = _build_client()
-
 SYSTEM = """You are an expert engineer working on a task in a Linux container. Your tools act inside it: bash (it \
 starts in {workdir}), read_file, write_file and edit_file. The container has no internet access.{mcp}
 
@@ -329,12 +374,12 @@ by a concise numbered list of concrete defects."""
 
 MCP_DIRECT = """
 
-The task also offers its own tools (the functions named <server>__<tool>)."""
+The task also offers its own tools (the functions named <server>__<tool>). Finalize and verify your calculations before invoking irreversible external MCP actions."""
 
 MCP_CATALOG = """
 
 The task also offers its own tools, listed below by server. Call mcp_find to see a tool's parameters, then mcp_call \
-to run it.
+to run it. Finalize and verify your calculations before invoking irreversible external MCP actions.
 {catalog}"""
 
 SUMMARY_PROMPT = """The conversation is getting long, so the earlier turns will be removed. Write notes that let you \
@@ -1030,15 +1075,31 @@ class Agent:
     self._needs_reaudit = False
     self._audit_staged = False
     self._has_self_checked_opt = False
+    self._opt_converged = False
+    self._last_summary_prose = ""
+
+  def _is_deliverable_target(self, target: str) -> bool:
+    norm_t = posixpath.normpath(target)
+    if norm_t.startswith(("/tmp/.ple_work_", "/private/tmp/.ple_work_")):
+      return False
+    norm_w = posixpath.normpath(self.session.workdir)
+    w_in_tmp = norm_w in ("/tmp", "/private/tmp") or norm_w.startswith(("/tmp/", "/private/tmp/"))
+    t_in_tmp = norm_t in ("/tmp", "/private/tmp") or norm_t.startswith(("/tmp/", "/private/tmp/"))
+    if t_in_tmp and not w_in_tmp:
+      return False
+    return True
 
   def _sync_final_message(self, prose: str = "") -> str:
-    prose = redact_secrets(prose)
+    clean_prose = redact_secrets(prose)
+    if clean_prose.strip():
+      self._last_summary_prose = clean_prose
+    effective_prose = self._last_summary_prose
     manifest = "\n".join(f"{p} ({sz} bytes)" for p, sz in self.delivered.items())
-    if not prose:
+    if not effective_prose:
       return f"Delivered files:\n{manifest}" if manifest else redact_secrets(self.session.final_message)
-    if manifest and any(f"{p} ({sz} bytes)" not in prose for p, sz in self.delivered.items()):
-      return f"{prose}\n\nDelivered files:\n{manifest}"
-    return prose
+    if manifest and any(f"{p} ({sz} bytes)" not in effective_prose for p, sz in self.delivered.items()):
+      return f"{effective_prose}\n\nDelivered files:\n{manifest}"
+    return effective_prose
 
   async def close(self) -> None:
     """Closes the underlying HTTP client."""
@@ -1099,7 +1160,7 @@ class Agent:
       text = visible(head + reply.text)
       if text and not reply.calls:
         self.session.final_message = self._sync_final_message(text)
-      elif text and not self.delivered:
+      elif text and not self.delivered and not self._last_summary_prose:
         self.session.final_message = redact_secrets(text)
       if not reply.calls:
         if visible(reply.text) and reply.finish == "length":
@@ -1164,6 +1225,16 @@ class Agent:
     Returns:
       The final summary text, falling back to `self.session.final_message`.
     """
+    left_pre = self.session.time_left()
+    if (
+        (bool(self.delivered) or self._workdir_dirty)
+        and self._needs_reaudit
+        and (left_pre is None or left_pre > 60)
+        and not self.session.cancelled.is_set()
+    ):
+      with contextlib.suppress(taskbridge.TaskError):
+        await self.audit_deliverables()
+      self.session.final_message = self._sync_final_message()
     self.messages.append({
         "role": "user",
         "content": (
@@ -1654,26 +1725,26 @@ class Agent:
         read_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
           await read_task
-        if head or (head is not None and not self.delivered):
-          self.session.final_message = (
-              visible(head + reply.text) or self.session.final_message
-          )
+        if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
+          partial = redact_secrets(visible(head + reply.text))
+          if partial:
+            self.session.final_message = partial
         raise taskbridge.Cancelled("cancelled")
       if not done:
         read_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
           await read_task
-        if head or (head is not None and not self.delivered):
-          self.session.final_message = (
-              visible(head + reply.text) or self.session.final_message
-          )
+        if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
+          partial = redact_secrets(visible(head + reply.text))
+          if partial:
+            self.session.final_message = partial
         raise CutOff() from None
       await read_task
     except asyncio.CancelledError:
-      if head or (head is not None and not self.delivered):
-        self.session.final_message = (
-            visible(head + reply.text) or self.session.final_message
-        )
+      if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
+        partial = redact_secrets(visible(head + reply.text))
+        if partial:
+          self.session.final_message = partial
       raise
     except openai.APIError as exc:
       # the SDK raises an error sent inside a chat stream as an APIError
@@ -1913,13 +1984,25 @@ class Agent:
     boot = self._audit_bootstrap_cmd(work_dir)
     cmd = f"mkdir -p -- {q_dir} && {boot} && python3 {q_audit} audit {q_wdir} {q_dir} {q_deliv}"
     res = await self.session.exec(cmd, timeout_sec=45)
-    self._audit_staged = True
     out = res.get("output") or ""
     marker = "__PLE_AUDIT_JSON__:"
     idx = out.find(marker)
-    if idx < 0:
+    if idx >= 0:
+      self._audit_staged = True
+    if res.get("exit_code", 0) != 0 or idx < 0:
+      self.audit_outcome = "error"
+      await self.session.log("[PLE_AUDIT] error: audit command failed")
       return []
-    data = json.loads(out[idx + len(marker) :].strip())
+    try:
+      data = json.loads(out[idx + len(marker) :].strip())
+    except ValueError as exc:
+      self.audit_outcome = "error"
+      await self.session.log(f"[PLE_AUDIT] error: {redact_secrets(str(exc))[:200]}")
+      return []
+    if not isinstance(data, dict):
+      self.audit_outcome = "error"
+      await self.session.log("[PLE_AUDIT] error: invalid audit payload")
+      return []
     self.audit_outcome = str(data.get("outcome") or "pass")
     self._needs_reaudit = False
     for path_k, sz in (data.get("sizes") or {}).items():
@@ -1993,24 +2076,27 @@ class Agent:
             " consistency, and provide your updated final summary."
         )
     max_opt = min(3, max(0, int(os.environ.get("PLE_MAX_OPT_ROUNDS", "3") or "3")))
+    if self._has_self_checked_opt and "OPTIMIZATION_CONVERGED" in text:
+      self._opt_converged = True
     if (
-        deliverable_audit.is_quantitative_optimization_task(
+        (bool(self.delivered) or self._workdir_dirty)
+        and deliverable_audit.is_quantitative_optimization_task(
             self.session.instruction
         )
+        and not self._opt_converged
         and self.opt_rounds < max_opt
     ):
-      if not (self._has_self_checked_opt and "OPTIMIZATION_CONVERGED" in text):
-        self.opt_rounds += 1
-        return (
-            f"Optimization pass ({self.opt_rounds}/{max_opt}): Run a"
-            " self-checked Python optimization script (include `assert` checks"
-            " verifying both a nominal feasible design pass and a"
-            " violated-constraint failure) using scipy or catalog search to"
-            " improve the objective within all constraints. Stage improved"
-            " deliverables via ._ple_stage_* + os.replace, or reply"
-            " OPTIMIZATION_CONVERGED with your final summary once certified"
-            " optimal."
-        )
+      self.opt_rounds += 1
+      return (
+          f"Optimization pass ({self.opt_rounds}/{max_opt}): Run a"
+          " self-checked Python optimization script (include `assert` checks"
+          " verifying both a nominal feasible design pass and a"
+          " violated-constraint failure) using scipy or catalog search to"
+          " improve the objective within all constraints. Stage improved"
+          " deliverables via ._ple_stage_* + os.replace, or reply"
+          " OPTIMIZATION_CONVERGED with your final summary once certified"
+          " optimal."
+      )
     if (
         os.environ.get("PLE_ENABLE_VERIFIER", "0").strip() == "1"
         and self.verifier_runs == 0
@@ -2033,8 +2119,6 @@ class Agent:
     """Executes `command` with bash and tees full output into `/tmp/.ple_work_*`."""
     if self.session.cancelled.is_set():
       raise taskbridge.Cancelled("cancelled")
-    if "assert" in command:
-      self._has_self_checked_opt = True
     cap = int(self.session.limits.get("exec_timeout_sec") or 600)
     left = self.session.time_left()
     if left is not None:
@@ -2060,10 +2144,16 @@ class Agent:
     result = await self.session.exec(
         wrapped, taskbridge.positive_int(timeout_sec, 120, cap)
     )
-    self._audit_staged = True
+    if not result.get("timed_out"):
+      self._audit_staged = True
+    if "assert" in command and result.get("exit_code") == 0 and not result.get("timed_out"):
+      self._has_self_checked_opt = True
     raw_out = result["output"] or ""
     if raw_out.endswith("\n__PLE_DIRTY__"):
       raw_out = raw_out[: -len("\n__PLE_DIRTY__")]
+      self._workdir_dirty = True
+      self._needs_reaudit = True
+    if result.get("timed_out"):
       self._workdir_dirty = True
       self._needs_reaudit = True
     note = " (timed out)" if result.get("timed_out") else ""
@@ -2132,9 +2222,15 @@ class Agent:
       raise taskbridge.TaskError(
           promo.get("output") or f"failed to promote {stage_path} to {target}"
       )
-    self.delivered[target] = len(payload)
-    self._needs_reaudit = True
-    self.session.final_message = self._sync_final_message()
+    if path.endswith(".py") and "assert " in content:
+      self._has_self_checked_opt = True
+    if self._is_deliverable_target(target):
+      self.delivered[target] = len(payload)
+      self._needs_reaudit = True
+      self.session.final_message = self._sync_final_message()
+    elif posixpath.basename(target) == "facts.json":
+      self._workdir_dirty = True
+      self._needs_reaudit = True
     return f"{path} now holds {len(payload)} bytes"
 
   async def edit_file(

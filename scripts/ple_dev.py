@@ -17,10 +17,23 @@
 
 from __future__ import annotations
 
-import argparse, csv, io, json, math, os, re, shlex, shutil, subprocess, sys, tempfile, urllib.parse
+import argparse
+import csv
 from decimal import Decimal, InvalidOperation
+import io
+import json
+import math
+import os
 from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
 from typing import Any
+import urllib.parse
+
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -28,47 +41,118 @@ ALLOWED_TIERS = ("STAGE1_FINAL_EXPORT", "LIVE_DOCKER_EVAL", "SYNTHETIC_PROTOCOL_
 DEV_SCORE_FLOOR = Decimal("0.138")
 MAX_SUBMISSION_LOCKS = 5
 FAILURE_BUCKETS = ("done_pass", "done_zero_score", "cancelled", "error", "unverified_judge")
-SECRET_ENV_VARS = ("MODEL_API_KEY", "MODEL_PROXY_KEY", "OPENAI_API_KEY", "JUDGE_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "HF_TOKEN")
-URL_ENV_VARS = ("MODEL_BASE_URL", "MODEL_PROXY_URL", "OPENAI_BASE_URL")
+SECRET_ENV_VARS = (
+  "MODEL_API_KEY",
+  "MODEL_PROXY_KEY",
+  "OPENAI_API_KEY",
+  "JUDGE_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "HF_TOKEN",
+)
+URL_ENV_VARS = (
+  "MODEL_BASE_URL",
+  "MODEL_PROXY_URL",
+  "OPENAI_BASE_URL",
+  "ANTHROPIC_BASE_URL",
+  "GOOGLE_GEMINI_BASE_URL",
+)
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 STAGE2_RATES_PER_M: dict[str, tuple[Decimal, ...]] = {
-    k: tuple(Decimal(x) for x in v) for k, v in (
-        ("claude-opus-5-5", ("4.00", "5.00", "0.20", "20.00")), ("gemini-4-argon", ("4.00", "4.00", "0.20", "20.00")),
-        ("gemini-3.8-flash", ("1.50", "1.50", "0.15", "7.50")), ("gemini-3.1-pro-preview", ("2.00", "2.00", "0.20", "12.00")),
-        ("glm-5.2", ("1.40", "1.40", "0.14", "4.40")), ("gemma-4-26b", ("0.15", "0.15", "0.015", "0.60")),
-        ("llama-4-maverick", ("0.35", "0.35", "0.35", "1.15")), ("gpt-oss-120b", ("0.09", "0.09", "0.09", "0.36")),
-    )
+  k: tuple(Decimal(x) for x in v) for k, v in (
+    ("claude-opus-5-5", ("4.00", "5.00", "0.20", "20.00")),
+    ("gemini-4-argon", ("4.00", "4.00", "0.20", "20.00")),
+    ("gemini-3.8-flash", ("1.50", "1.50", "0.15", "7.50")),
+    ("gemini-3.1-pro-preview", ("2.00", "2.00", "0.20", "12.00")),
+    ("glm-5.2", ("1.40", "1.40", "0.14", "4.40")),
+    ("gemma-4-26b", ("0.15", "0.15", "0.015", "0.60")),
+    ("llama-4-maverick", ("0.35", "0.35", "0.35", "1.15")),
+    ("gpt-oss-120b", ("0.09", "0.09", "0.09", "0.36")),
+  )
 }
 _SECRET_RES = (
-    (re.compile(r"(https?://)([^/\s@]+)@"), r"\1[REDACTED]@"), (re.compile(r"(?i)(bearer\s+)\S+"), r"\1[REDACTED]"),
-    (re.compile(r"(?:sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{16,}|hf_[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16})"), "[REDACTED]"),
+  (re.compile(r"(https?://)([^/\s@]+)@"), r"\1[REDACTED]@"),
+  (re.compile(r'([?&](?:api_?key|key|token|access_token)=)[^&#\s"\']+', re.IGNORECASE), r"\1[REDACTED]"),
+  (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-+/=:~]{4,}"), r"\1[REDACTED]"),
+  (
+    re.compile(
+      r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+      r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    ),
+    "[REDACTED]",
+  ),
+  (
+    re.compile(
+      r"(?<![A-Za-z0-9])(?:"
+      r"sk-[A-Za-z0-9_\-]{8,}"
+      r"|AIza[A-Za-z0-9_\-]{16,}"
+      r"|hf_[A-Za-z0-9_\-]{16,}"
+      r"|gh[pousr]_[A-Za-z0-9_]{16,}"
+      r"|github_pat_[A-Za-z0-9_]{16,}"
+      r"|AKIA[0-9A-Z]{16}"
+      r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+      r")"
+    ),
+    "[REDACTED]",
+  ),
 )
+
 
 def _err(msg: str, code: int = 2) -> int:
   sys.stderr.write(msg + "\n")
   return code
 
+
+def _collect_secret_values() -> list[str]:
+  found: set[str] = set()
+  for k in SECRET_ENV_VARS:
+    val = (os.environ.get(k) or "").strip()
+    if len(val) >= 4 and val.lower() not in {"none", "null", "empty"}:
+      found.add(val)
+  for key in URL_ENV_VARS:
+    raw_url = (os.environ.get(key) or "").strip()
+    if not raw_url:
+      continue
+    try:
+      p = urllib.parse.urlsplit(raw_url)
+    except ValueError:
+      continue
+    user = p.username or ""
+    pwd = p.password or ""
+    unq_user = urllib.parse.unquote(user) if user else ""
+    unq_pwd = urllib.parse.unquote(pwd) if pwd else ""
+    for item in (user, unq_user, pwd, unq_pwd):
+      if len(item) >= 4 and item.lower() not in {"none", "null", "empty"}:
+        found.add(item)
+    if user and pwd:
+      found.add(f"{user}:{pwd}")
+      found.add(f"{unq_user}:{unq_pwd}")
+    for qk, qvals in urllib.parse.parse_qs(p.query).items():
+      if qk.lower() in {"api_key", "apikey", "key", "token", "access_token"}:
+        for qv in qvals:
+          if len(qv) >= 4:
+            found.add(qv)
+  return sorted(found, key=len, reverse=True)
+
+
 def redact_secrets(text: str) -> str:
   if not text:
     return ""
-  found = {v for k in SECRET_ENV_VARS if len(v := (os.environ.get(k) or "").strip()) >= 4 and v.lower() not in {"none", "null", "empty"}}
-  for key in URL_ENV_VARS:
-    try:
-      p = urllib.parse.urlsplit((os.environ.get(key) or "").strip())
-      if p.password:
-        found.update({p.password, *([f"{p.username}:{p.password}"] if p.username else [])})
-    except ValueError:
-      pass
   out = text
-  for secret in sorted(found, key=len, reverse=True):
+  for secret in _collect_secret_values():
     out = out.replace(secret, "[REDACTED]")
   for pat, repl in _SECRET_RES:
     out = pat.sub(repl, out)
   return out
 
+
 def _clean_text(value: Any) -> str:
   s = redact_secrets(str(value if value is not None else "")).replace(chr(0x2028), " ").replace(chr(0x2029), " ")
   return redact_secrets(_CTRL_RE.sub(" ", s).strip())
+
+
+def _escape_md(v: Any) -> str:
+  return _clean_text(v).replace("|", "\\|")
 
 def _stage2_cost_usd(model_name: str, u: int, cw: int, cr: int, out_t: int) -> Decimal:
   r = STAGE2_RATES_PER_M.get((model_name or "").strip().lower().rsplit("/", 1)[-1])
@@ -92,6 +176,8 @@ def cmd_run(args: argparse.Namespace) -> int:
   repo_path, out_path = Path(args.repo).resolve(), Path(args.out).resolve()
   if out_path == repo_path or out_path.is_relative_to(repo_path):
     return _err("--out must resolve outside --repo.")
+  if out_path.exists() and (not out_path.is_dir() or any(out_path.iterdir())):
+    return _err("--out must be a new or empty directory.")
   rev_res = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"], text=True, capture_output=True, check=False)
   if rev_res.returncode != 0:
     return _err("Failed to resolve git HEAD in --repo.")
@@ -117,68 +203,163 @@ def cmd_run(args: argparse.Namespace) -> int:
     subprocess.run(["git", "-C", str(repo_path), "worktree", "prune"], capture_output=True, check=False)
 
 
+def _nonneg_int(val: Any) -> int:
+  if val is None or val == "":
+    return 0
+  if isinstance(val, bool):
+    raise ValueError("Invalid boolean token count")
+  return max(0, int(val))
+
+
 def _load_run_summary(run_dir: Path) -> dict[str, Any]:
   if not (run_dir / "results.json").is_file():
     raise ValueError(f"Missing results.json in {run_dir.name}")
   raw_res = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
+  if not isinstance(raw_res, dict):
+    raise ValueError(f"Invalid results.json object in {run_dir.name}")
   submission = _clean_text(raw_res.get("submission") or run_dir.name)
-  run_model, judge_model = _clean_text(raw_res.get("model") or ""), _clean_text(raw_res.get("judge_model") or "")
-  unmeasured_ids = {str(x) for x in (raw_res.get("unmeasured") or [])}
+  run_model = _clean_text(raw_res.get("model") or "")
+  judge_model = _clean_text(raw_res.get("judge_model") or "")
+  raw_unmeasured = raw_res.get("unmeasured") or []
+  if not isinstance(raw_unmeasured, list):
+    raise ValueError("Invalid unmeasured list in results.json")
+  unmeasured_ids = {str(x) for x in raw_unmeasured}
+
+  run_res = run_dir.resolve()
   log_rollups: list[tuple[Path, dict[str, Any]]] = []
   for p in sorted(run_dir.rglob("*")):
-    if p.is_file() and p.suffix in {".txt", ".log"}:
-      for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-        if (pos := line.find("[PLE_ROLLUP]")) >= 0:
-          try:
-            if isinstance(obj := json.loads(line[pos + len("[PLE_ROLLUP]"):].strip()), dict):
-              log_rollups.append((p, obj))
-          except json.JSONDecodeError:
-            pass
-  raw_tasks = list(raw_res.get("tasks") or [])
-  used_idx, matched = set(), {}
+    if not p.is_file() or p.suffix not in {".txt", ".log"}:
+      continue
+    rel_parts = p.relative_to(run_dir).parts
+    if len(rel_parts) < 2 or rel_parts[0] in {"tasks", "artifacts"}:
+      continue
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+      if (pos := line.find("[PLE_ROLLUP]")) >= 0:
+        try:
+          obj = json.loads(line[pos + len("[PLE_ROLLUP]") :].strip())
+          if isinstance(obj, dict):
+            log_rollups.append((p.resolve(), obj))
+        except json.JSONDecodeError:
+          pass
+
+  raw_tasks_val = raw_res.get("tasks") or []
+  if not isinstance(raw_tasks_val, list) or any(not isinstance(x, dict) for x in raw_tasks_val):
+    raise ValueError("Invalid tasks array in results.json")
+  raw_tasks: list[dict[str, Any]] = list(raw_tasks_val)
+
+  used_idx: set[int] = set()
+  matched: dict[int, dict[str, Any]] = {}
   for t_i, t in enumerate(raw_tasks):
-    tid, trial = str(t.get("id") or ""), str(t.get("trial") or "").strip()
-    found_j = next((j for j in reversed(range(len(log_rollups))) if trial and log_rollups[j][0].resolve().is_relative_to((run_dir / trial).resolve())), None)
-    if found_j is None and tid:
-      found_j = next((j for j in reversed(range(len(log_rollups))) if j not in used_idx and (str(log_rollups[j][1].get("task_id") or "") == tid or tid in log_rollups[j][0].relative_to(run_dir).parts or log_rollups[j][0].stem.startswith(tid))), None)
+    raw_tid = str(t.get("id") or "").strip()
+    trial = str(t.get("trial") or "").strip()
+    found_j: int | None = None
+    if trial:
+      trial_dir = (run_dir / trial).resolve()
+      if trial_dir != run_res and trial_dir.is_relative_to(run_res):
+        found_j = next(
+          (j for j in reversed(range(len(log_rollups))) if log_rollups[j][0].is_relative_to(trial_dir)),
+          None,
+        )
+    elif raw_tid:
+      found_j = next(
+        (
+          j for j in reversed(range(len(log_rollups)))
+          if j not in used_idx
+          and any(
+            part == raw_tid or part.startswith(f"{raw_tid}__")
+            for part in log_rollups[j][0].relative_to(run_res).parts[:-1]
+          )
+        ),
+        None,
+      )
     if found_j is not None:
-      matched[t_i], _ = log_rollups[found_j][1], used_idx.add(found_j)
-  unmatched = [i for i in range(len(raw_tasks)) if i not in matched]
-  rem = [(j, r) for j, (_, r) in enumerate(log_rollups) if j not in used_idx]
-  if unmatched and len(unmatched) == len(rem):
-    for t_i, (j, r) in zip(unmatched, rem):
-      matched[t_i], _ = r, used_idx.add(j)
+      matched[t_i] = log_rollups[found_j][1]
+      used_idx.add(found_j)
 
-  def _metrics(r_obj: dict[str, Any] | None) -> tuple[list[int], Decimal, str]:
-    if not r_obj:
-      return ([0, 0, 0, 0], Decimal("0"), "")
-    toks = [max(0, int(r_obj.get(k, 0) or 0)) for k in ("uncached_input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")]
-    raw_c = r_obj.get("cost_usd")
-    return (toks, Decimal(str(raw_c)) if raw_c is not None else _stage2_cost_usd(_clean_text(r_obj.get("model") or run_model), *toks), _clean_text(r_obj.get("status") or "").lower())
+  def _task_metrics(t_obj: dict[str, Any], r_obj: dict[str, Any] | None) -> tuple[list[int], Decimal, str]:
+    if r_obj is not None:
+      toks = [
+        _nonneg_int(r_obj.get(k, 0))
+        for k in ("uncached_input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens")
+      ]
+      raw_c = r_obj.get("cost_usd")
+      if raw_c is not None:
+        if isinstance(raw_c, bool):
+          raise ValueError("Invalid boolean cost_usd in rollup")
+        cost = Decimal(str(raw_c))
+        if not cost.is_finite() or cost < 0:
+          raise ValueError("Non-finite or negative cost_usd in rollup")
+      else:
+        cost = _stage2_cost_usd(_clean_text(r_obj.get("model") or run_model), *toks)
+      return (toks, cost, _clean_text(r_obj.get("status") or "").lower())
+    tok_d = t_obj.get("tokens")
+    if isinstance(tok_d, dict):
+      in_tot = max(0, _nonneg_int(tok_d.get("input")))
+      cr = min(in_tot, max(0, _nonneg_int(tok_d.get("cache"))))
+      ui = in_tot - cr
+      out_t = max(0, _nonneg_int(tok_d.get("output")))
+      return ([ui, 0, cr, out_t], _stage2_cost_usd(run_model, ui, 0, cr, out_t), "")
+    return ([0, 0, 0, 0], Decimal("0"), "")
 
-  tasks_map, tok_sums, tot_cost = {}, [0, 0, 0, 0], Decimal("0")
+  non_judge_kinds = {"evaluator", "not started", "harbor failed", "image", "checks failed", "no trial", "task error"}
+  tasks_map: dict[str, dict[str, Any]] = {}
+  tok_sums = [0, 0, 0, 0]
+  tot_cost = Decimal("0")
   for t_i, t in enumerate(raw_tasks):
-    tid = _clean_text(t.get("id") or f"task-{t_i}")
-    toks, cost, r_status = _metrics(matched.get(t_i))
-    tok_sums, tot_cost = [a + b for a, b in zip(tok_sums, toks)], tot_cost + cost
-    kind, t_status = _clean_text(t.get("kind") or "").lower(), _clean_text(t.get("status") or "").lower()
+    raw_tid = str(t.get("id") or f"task-{t_i}")
+    tid = _clean_text(raw_tid)
+    toks, cost, r_status = _task_metrics(t, matched.get(t_i))
+    tok_sums = [a + b for a, b in zip(tok_sums, toks)]
+    tot_cost += cost
+    kind = _clean_text(t.get("kind") or "").lower()
+    t_status = _clean_text(t.get("status") or "").lower()
     raw_score = t.get("score") if t.get("score") is not None else t.get("reward")
-    unverified = (tid in unmeasured_ids) or (t.get("measured") is False) or kind in {"grader failed", "unmeasured", "missing_judge"} or (raw_score is None)
+    unverified = (
+      (raw_tid in unmeasured_ids)
+      or (tid in unmeasured_ids)
+      or (t.get("measured") is False)
+      or kind in {"grader failed", "unmeasured", "missing_judge"}
+      or (raw_score is None)
+    )
     if unverified:
-      ver_status = "UNVERIFIED_MISSING_JUDGE" if (not judge_model or tid in unmeasured_ids or "grader failed" in kind) else "UNVERIFIED"
-      score_val, bucket = None, "unverified_judge"
+      score_val = None
+      if kind in {"grader failed", "missing_judge"}:
+        ver_status, bucket = "UNVERIFIED_MISSING_JUDGE", "unverified_judge"
+      elif kind in non_judge_kinds or r_status == "error":
+        ver_status, bucket = "UNVERIFIED", "error"
+      elif not judge_model or kind in {"", "unmeasured"}:
+        ver_status, bucket = "UNVERIFIED_MISSING_JUDGE", "unverified_judge"
+      else:
+        ver_status, bucket = "UNVERIFIED", "error"
     else:
-      ver_status, score_val = "VERIFIED", float(raw_score)
-      bucket = "cancelled" if (r_status == "cancelled" or t_status == "cancelled" or "timeout" in kind) else ("error" if (r_status == "error" or t_status == "error" or kind in {"error", "agent failed", "harness_error"}) else ("done_pass" if score_val > 0.0 else "done_zero_score"))
+      if isinstance(raw_score, bool):
+        raise ValueError("Invalid boolean task score")
+      score_val = float(raw_score)
+      if not math.isfinite(score_val):
+        raise ValueError("Non-finite task score")
+      ver_status = "VERIFIED"
+      if r_status == "cancelled" or t_status == "cancelled" or "timeout" in kind or "timeout" in t_status:
+        bucket = "cancelled"
+      elif (
+        r_status == "error"
+        or t_status == "error"
+        or kind in {"error", "agent failed", "harness_error", "harness"}
+        or t_status.startswith("harness:")
+      ):
+        bucket = "error"
+      elif score_val > 0.0:
+        bucket = "done_pass"
+      else:
+        bucket = "done_zero_score"
     tasks_map[tid] = {"score": score_val, "cost": cost, "verified": not unverified, "ver_status": ver_status, "bucket": bucket}
+
   for cid in (_clean_text(x) for x in sorted(unmeasured_ids)):
-    tasks_map.setdefault(cid, {"score": None, "cost": Decimal("0"), "verified": False, "ver_status": "UNVERIFIED_MISSING_JUDGE", "bucket": "unverified_judge"})
-  for j, (_, r_obj) in enumerate(log_rollups):
-    if j not in used_idx:
-      toks, cost, _ = _metrics(r_obj)
-      tok_sums, tot_cost = [a + b for a, b in zip(tok_sums, toks)], tot_cost + cost
+    default_vs = "UNVERIFIED_MISSING_JUDGE" if not judge_model else "UNVERIFIED"
+    default_bk = "unverified_judge" if not judge_model else "error"
+    tasks_map.setdefault(cid, {"score": None, "cost": Decimal("0"), "verified": False, "ver_status": default_vs, "bucket": default_bk})
   label = f"{submission} ({_clean_text(run_dir.name)})" if submission != _clean_text(run_dir.name) else submission
   return {"path": run_dir, "label": label, "model": run_model, "tasks": tasks_map, "executed_count": len(raw_tasks), "toks": tok_sums, "tot_cost": tot_cost}
+
 
 def _write_csv_and_md(out_dir: Path, stem: str, title: str, headers: list[str], csv_rows: list[list[str]], md_rows: list[list[str]]) -> None:
   buf = io.StringIO()
@@ -186,8 +367,13 @@ def _write_csv_and_md(out_dir: Path, stem: str, title: str, headers: list[str], 
   w.writerow(headers)
   w.writerows(csv_rows)
   _write_text(out_dir / f"{stem}.csv", buf.getvalue())
-  esc = lambda v: _clean_text(v).replace("|", "\\|")
-  md = [f"# {title}", "", "| " + " | ".join(esc(h) for h in headers) + " |", "| " + " | ".join("---" for _ in headers) + " |", *("| " + " | ".join(esc(c) for c in row) + " |" for row in md_rows)]
+  md = [
+    f"# {title}",
+    "",
+    "| " + " | ".join(_escape_md(h) for h in headers) + " |",
+    "| " + " | ".join("---" for _ in headers) + " |",
+    *("| " + " | ".join(_escape_md(c) for c in row) + " |" for row in md_rows),
+  ]
   _write_text(out_dir / f"{stem}.md", "\n".join(md) + "\n")
 
 
@@ -196,12 +382,18 @@ def cmd_export_writeup(args: argparse.Namespace) -> int:
   base_dir = Path(args.baseline_run).resolve() if args.baseline_run else None
   all_dirs = [*run_dirs, *([base_dir] if base_dir and base_dir not in run_dirs else [])]
   meta_tiers: list[str] = []
-  for d in all_dirs:
-    if (d / "ple_run_meta.json").is_file():
-      t = str(json.loads((d / "ple_run_meta.json").read_text(encoding="utf-8")).get("tier") or "")
-      if t not in ALLOWED_TIERS:
-        return _err("Invalid tier inside ple_run_meta.json.")
-      meta_tiers.append(t)
+  try:
+    for d in all_dirs:
+      if (d / "ple_run_meta.json").is_file():
+        meta_obj = json.loads((d / "ple_run_meta.json").read_text(encoding="utf-8"))
+        if not isinstance(meta_obj, dict):
+          return _err("Invalid ple_run_meta.json object.")
+        t = str(meta_obj.get("tier") or "")
+        if t not in ALLOWED_TIERS:
+          return _err("Invalid tier inside ple_run_meta.json.")
+        meta_tiers.append(t)
+  except (OSError, ValueError, TypeError, AttributeError) as exc:
+    return _err(_clean_text(str(exc)))
   if args.tier is not None:
     if args.tier not in ALLOWED_TIERS or (args.tier == "STAGE1_FINAL_EXPORT" and any(t != "STAGE1_FINAL_EXPORT" for t in meta_tiers)):
       return _err("Invalid or disallowed --tier badge.")
@@ -214,7 +406,7 @@ def cmd_export_writeup(args: argparse.Namespace) -> int:
   try:
     summaries = [_load_run_summary(d) for d in run_dirs]
     base_sum = _load_run_summary(base_dir) if base_dir else summaries[0]
-  except (OSError, ValueError, json.JSONDecodeError) as exc:
+  except (OSError, ValueError, TypeError, AttributeError, InvalidOperation) as exc:
     return _err(_clean_text(str(exc)))
 
   out_dir = Path(args.out_dir).resolve()
@@ -254,22 +446,54 @@ def cmd_export_writeup(args: argparse.Namespace) -> int:
 
 
 def cmd_lock_submission(args: argparse.Namespace) -> int:
-  if math.isnan(args.mean_score) or math.isinf(args.mean_score):
+  if not math.isfinite(args.mean_score):
     return _err("Invalid --mean-score.")
   try:
     score_dec = Decimal(str(args.mean_score))
   except InvalidOperation:
     return _err("Invalid --mean-score decimal.")
+  if not score_dec.is_finite():
+    return _err("Invalid --mean-score decimal.")
   if score_dec < DEV_SCORE_FLOOR:
     return _err(f"Rejected: mean_score {score_dec} is below {DEV_SCORE_FLOOR}.", 1)
   ledger_path = Path(args.ledger).resolve()
-  existing = list(json.loads(ledger_path.read_text(encoding="utf-8")).get("locks") or []) if ledger_path.is_file() else []
+  existing: list[dict[str, Any]] = []
+  if ledger_path.is_file():
+    try:
+      raw_ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+      if not isinstance(raw_ledger, dict):
+        return _err("Invalid submission ledger JSON object.")
+      raw_locks = raw_ledger.get("locks") or []
+      if not isinstance(raw_locks, list) or any(not isinstance(x, dict) for x in raw_locks):
+        return _err("Invalid locks array in submission ledger.")
+      for x in raw_locks:
+        if isinstance(x.get("mean_score"), bool) or not Decimal(str(x.get("mean_score", 0.0))).is_finite():
+          return _err("Non-finite mean_score in submission ledger.")
+      existing = list(raw_locks)
+    except (OSError, ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+      return _err(_clean_text(str(exc)))
   if len(existing) >= MAX_SUBMISSION_LOCKS:
     return _err(f"Rejected: submission ledger reached lifetime cap ({MAX_SUBMISSION_LOCKS}).", 1)
-  locks = [{"lock_index": i + 1, "git_rev": _clean_text(x.get("git_rev", "")), "model_api": _clean_text(x.get("model_api", "")), "mean_score": float(x.get("mean_score", 0.0)), "notes": _clean_text(x.get("notes", ""))} for i, x in enumerate(existing)]
-  locks.append({"lock_index": len(locks) + 1, "git_rev": _clean_text(args.git_rev), "model_api": _clean_text(args.model_api), "mean_score": float(score_dec), "notes": _clean_text(args.notes)})
+  locks = [
+    {
+      "lock_index": i + 1,
+      "git_rev": _clean_text(x.get("git_rev", "")),
+      "model_api": _clean_text(x.get("model_api", "")),
+      "mean_score": float(x.get("mean_score", 0.0)),
+      "notes": _clean_text(x.get("notes", "")),
+    }
+    for i, x in enumerate(existing)
+  ]
+  locks.append({
+    "lock_index": len(locks) + 1,
+    "git_rev": _clean_text(args.git_rev),
+    "model_api": _clean_text(args.model_api),
+    "mean_score": float(score_dec),
+    "notes": _clean_text(args.notes),
+  })
   _write_text(ledger_path, json.dumps({"locks": locks}, indent=2) + "\n")
   return 0
+
 
 def cmd_hygiene(args: argparse.Namespace) -> int:
   repo_path = Path(args.repo).resolve()
@@ -284,16 +508,21 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
     art = subprocess.run(["uv", "run", "python", "-m", "kit", "artifacts", str(repo_path)], cwd=str(ple_root), check=False)
     if art.returncode != 0:
       return int(art.returncode)
-  return int(subprocess.run(["uv", "run", "python", "-m", "kit", "check", str(repo_path)], cwd=str(ple_root), check=False).returncode)
+  kit_cmd = ["uv", "run", "python", "-m", "kit", "check"]
+  if args.env_file:
+    kit_cmd.extend(["--env-file", str(Path(args.env_file).resolve())])
+  kit_cmd.append(str(repo_path))
+  return int(subprocess.run(kit_cmd, cwd=str(ple_root), check=False).returncode)
+
 
 def build_parser() -> argparse.ArgumentParser:
   p = argparse.ArgumentParser(description="PLE external worktree runner & Writeup exporter CLI.")
   sub = p.add_subparsers(dest="subcommand", required=True)
   specs = (
-      ("run", cmd_run, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--out", {"required": True}), ("--tasks", {}), ("--env-file", {}), ("--model-api", {}), ("--eval-cmd", {"default": "uv run python eval/run.py"}), ("--tier", {"default": "LIVE_DOCKER_EVAL"}))),
-      ("export-writeup", cmd_export_writeup, (("--runs", {"nargs": "+", "required": True}), ("--baseline-run", {}), ("--out-dir", {"required": True}), ("--tier", {}))),
-      ("lock-submission", cmd_lock_submission, (("--ledger", {"required": True}), ("--git-rev", {"required": True}), ("--model-api", {"required": True}), ("--mean-score", {"type": float, "required": True}), ("--notes", {"default": ""}))),
-      ("hygiene", cmd_hygiene, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--skip-kit", {"action": "store_true"}), ("--hygiene-script", {}))),
+    ("run", cmd_run, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--out", {"required": True}), ("--tasks", {}), ("--env-file", {}), ("--model-api", {}), ("--eval-cmd", {"default": "uv run python eval/run.py"}), ("--tier", {"default": "LIVE_DOCKER_EVAL"}))),
+    ("export-writeup", cmd_export_writeup, (("--runs", {"nargs": "+", "required": True}), ("--baseline-run", {}), ("--out-dir", {"required": True}), ("--tier", {}))),
+    ("lock-submission", cmd_lock_submission, (("--ledger", {"required": True}), ("--git-rev", {"required": True}), ("--model-api", {"required": True}), ("--mean-score", {"type": float, "required": True}), ("--notes", {"default": ""}))),
+    ("hygiene", cmd_hygiene, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--env-file", {}), ("--skip-kit", {"action": "store_true"}), ("--hygiene-script", {}))),
   )
   for name, fn, flags in specs:
     sp = sub.add_parser(name)

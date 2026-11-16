@@ -10,10 +10,10 @@ This repository is a clean, standalone competition entry created after rules acc
 
 Portions of this repository are vendored or adapted from [google-research/ple](https://github.com/google-research/ple) (`Copyright 2026 Google LLC`, licensed under `Apache-2.0`):
 
-- `taskbridge.py`: Vendored official WebSocket Protocol v1 server bridge (`Copyright 2026 Google LLC`, `Apache-2.0`).
+- `taskbridge.py`: Vendored and trimmed WebSocket Protocol v1 server bridge from `google-research/ple` (`Copyright 2026 Google LLC`, `Apache-2.0`).
 - `harness.py` & `serve.py`: Adapted from the upstream `sample_submissions/custom-openai` and `sample_submissions/plan-verify` reference harnesses (`Copyright 2026 Google LLC`, `Apache-2.0`), extended with immutable-prefix caching discipline, static family-aware reasoning effort, atomic file staging, secret redaction, task-side deliverable auditing, and Stage-2 cost telemetry.
 
-All runtime dependencies pinned in `requirements.txt` (`openai`, `websockets`, `XlsxWriter`, `openpyxl`, `python-docx`, `pdfplumber`, `scipy`, `pint`) use permissive open-source licenses (`Apache-2.0`, `BSD-3-Clause`, `BSD-2-Clause`, `MIT`).
+`requirements.txt` pins the two Serve-container runtime packages (`openai`, `websockets`) alongside six permissively licensed verification and reference packages (`XlsxWriter`, `openpyxl`, `python-docx`, `pdfplumber`, `scipy`, `pint`) under `Apache-2.0`, `BSD-3-Clause`, `BSD-2-Clause`, and `MIT` licenses.
 
 ## Architecture
 
@@ -24,11 +24,11 @@ All runtime dependencies pinned in `requirements.txt` (`openai`, `websockets`, `
   - **Zero-I/O Cancel & Secret Redaction**: Immediately raises `taskbridge.Cancelled` with zero extra model or container calls when `cancel` arrives, and scrubs active credentials/URLs from all log and error frames.
   - **January-2027 Stage-2 Telemetry**: Emits a single sanitized `[PLE_ROLLUP]` JSON record per task computing exact `Decimal` Stage-2 list USD cost across uncached input, cache-write, cache-read, and output tokens.
 - **`deliverable_audit.py` (Task-Side Deliverable Audit & OOXML Patcher)**:
-  - **Pure-Stdlib OOXML `<v>` Patcher**: Audits `.xlsx` workbooks directly as ZIP/XML archives without `openpyxl.save()` round-trip corruption, preserving existing cached `<v>` tags and topologically evaluating deterministic formula cells (`SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `ABS`, `ROUND`, `SQRT`, `IF`, `IFERROR`, `AND`, `OR`, `NOT`) while flagging Excel error tokens (`#REF!`, `#DIV/0!`, `#VALUE!`, `#NAME?`, `#NUM!`, `#N/A`, `#NULL!`) and volatile formulas.
-  - **Cross-Document Consistency & Conditional Optimization**: Audits `.docx`, `.pdf`, `.csv`, `.json`, and `.md` deliverables for non-empty structure and cross-file numerical consistency, gates `<= 3` bounded numerical optimization rounds via `is_quantitative_optimization_task`, and keeps the optional read-only second-pass auditor OFF by default (`PLE_ENABLE_VERIFIER=0`).
+  - **Pure-Stdlib OOXML `<v>` Patcher**: Audits produced or modified `.xlsx` workbooks directly as ZIP/XML archives (across `workdir` and sibling `/filesystem` roots) without `openpyxl.save()` round-trip corruption, leaving untouched baseline `.xlsx` fixtures and unchanged `TODAY()`/`NOW()` cached `<v>` tags intact while topologically evaluating dirty formula cells (`SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `ABS`, `ROUND`, `SQRT`, `IF`, `IFERROR`, `AND`, `OR`, `NOT`) and flagging Excel error tokens (`#REF!`, `#DIV/0!`, `#VALUE!`, `#NAME?`, `#NUM!`, `#N/A`, `#NULL!`).
+  - **Cross-Document Consistency & Conditional Optimization**: Validates `.pdf` deliverables for non-empty `%PDF-` headers, cross-checks `.xlsx`, `.docx`, `.json`, and UTF-8 text deliverables (`.csv`, `.md`, up to 2 MiB) against canonical `facts.json` quantities, gates `<= 3` bounded numerical optimization rounds via `is_quantitative_optimization_task`, and keeps the optional read-only second-pass auditor OFF by default (`PLE_ENABLE_VERIFIER=0`).
 - **`scripts/ple_dev.py` (External Worktree Runner & Writeup Exporter)**:
-  - Runs `eval/run.py --no-export` from a detached temporary `git worktree` writing to an external `--out` directory so the main checkout stays untouched.
-  - Exports deterministic CSV and Markdown tables for Writeup Figures 1–3 (`figure1_pareto`, `figure2_ablation`, `figure3_failures`) stamped with explicit execution-tier badges (`STAGE1_FINAL_EXPORT`, `LIVE_DOCKER_EVAL`, `SYNTHETIC_PROTOCOL_TEST`) and `UNVERIFIED_MISSING_JUDGE` markers whenever `OPENAI_API_KEY` is absent.
+  - Runs `eval/run.py --no-export` from a detached temporary `git worktree` writing to a fresh external `--out` directory so the main checkout stays untouched.
+  - Exports deterministic CSV and Markdown tables for Writeup Figures 1–3 (`figure1_pareto`, `figure2_ablation`, `figure3_failures`) stamped with explicit execution-tier badges (`STAGE1_FINAL_EXPORT`, `LIVE_DOCKER_EVAL`, `SYNTHETIC_PROTOCOL_TEST`), valuing both `[PLE_ROLLUP]` telemetry and official `results.json` baseline `tokens` counts while deriving `UNVERIFIED_MISSING_JUDGE` vs `UNVERIFIED` status directly from `results.json` judge and grader fields.
   - Enforces the `mean_score >= 0.138` dev-set floor and `<= 5` lifetime cap for Stage-1 submission locks (`lock-submission`).
 
 ## Exact Reproduction Commands
@@ -36,7 +36,9 @@ All runtime dependencies pinned in `requirements.txt` (`openai`, `websockets`, `
 ### 1. Run Unit, Integration & Property Tests (`P1..P4`)
 
 ```bash
-pytest tests -v
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt PyYAML==6.0.3 pytest hypothesis
+.venv/bin/pytest tests -v
 ```
 
 ### 2. Cleanroom Container Smoke, MCP & Cancel Check (`kit check`)
@@ -77,5 +79,5 @@ python3 scripts/ple_dev.py lock-submission \
   --mean-score <dev-mean-score> \
   --notes "Stage-1 verified candidate"
 
-python3 scripts/ple_dev.py hygiene --repo <path-to-repo> --ple-root <path-to-ple>
+python3 scripts/ple_dev.py hygiene --repo <path-to-repo> --ple-root <path-to-ple> --env-file <path-to-env-file>
 ```

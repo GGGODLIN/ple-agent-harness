@@ -43,7 +43,7 @@ if str(TESTS_DIR) not in sys.path:
   sys.path.insert(0, str(TESTS_DIR))
 
 from test_seam1_core import CONTAINER_CMD_TYPES, _env_scope, _sse_reply, evaluate_p2_oracle  # noqa: E402
-from test_seam1_gate import REPO_ROOT, StubOpenAIServer, _free_tcp_port, _load_repo_module, _sse_text_reply, _sse_tool_call_reply  # noqa: E402
+from test_seam1_gate import REPO_ROOT, StubOpenAIServer, _free_tcp_port, _load_repo_module, _safe_subprocess_env, _sse_text_reply, _sse_tool_call_reply  # noqa: E402
 
 COPYLEFT_RE = re.compile(r"\b(?:pymupdf|fitz|formulas)\b", re.IGNORECASE)
 
@@ -52,10 +52,23 @@ def _has_copyleft_ref(text: str) -> bool:
   return COPYLEFT_RE.search(text) is not None
 
 
-def _path_without_soffice() -> str:
-  venv_bin = str(Path(sys.executable).parent)
-  rest = [e for e in os.environ.get("PATH", "").split(os.pathsep) if e and not (Path(e) / "soffice").exists()]
-  return os.pathsep.join([venv_bin, *rest])
+def _path_without_soffice(tmp_dir: Path) -> str:
+  py_dir = Path(sys.executable).parent
+  if (py_dir / "soffice").exists():
+    shim_bin = tmp_dir / ".ple_no_soffice_bin"
+    shim_bin.mkdir(parents=True, exist_ok=True)
+    for name in ("python3", "python"):
+      link = shim_bin / name
+      if not link.exists():
+        link.symlink_to(sys.executable)
+    head = str(shim_bin)
+  else:
+    head = str(py_dir)
+  rest = [
+    e for e in os.environ.get("PATH", "").split(os.pathsep)
+    if e and Path(e) != py_dir and not (Path(e) / "soffice").exists()
+  ]
+  return os.pathsep.join([head, *rest])
 
 
 async def _run_audit_ws(
@@ -87,9 +100,12 @@ async def _run_audit_ws(
               break
             if ftype == "exec":
               exec_idx += 1
-              c_env = {**os.environ, "PLEBENCH_EXEC_ID": f"ple-exec-{exec_idx}"}
+              overrides = {"PLEBENCH_EXEC_ID": f"ple-exec-{exec_idx}"}
+              if "PLE_DISABLE_SOFFICE" in env:
+                overrides["PLE_DISABLE_SOFFICE"] = env["PLE_DISABLE_SOFFICE"]
               if exec_path is not None:
-                c_env["PATH"] = exec_path
+                overrides["PATH"] = exec_path
+              c_env = _safe_subprocess_env(overrides)
               proc = subprocess.run(["bash", "-c", frame["command"]], cwd=str(workdir), env=c_env, capture_output=True, timeout=5.0)
               out = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
               await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "exit_code": proc.returncode, "output": out[:100_000], "truncated": len(out) > 100_000, "timed_out": False}))
@@ -197,7 +213,7 @@ def test_ooxml_audit_without_soffice_and_facts_json_crosscheck(tmp_path: Path) -
   ws_calc.write_formula("B1", "=NORM.S.DIST(1.96,TRUE)", None, 0.9750021)
   ws_calc.write_formula("B2", "=ROUND(Inputs!B1*Inputs!B2+Inputs!B3^2,2)", None, 166.0)
   wb.close()
-  no_soffice_path = _path_without_soffice()
+  no_soffice_path = _path_without_soffice(tmp_path)
   assert shutil.which("soffice", path=no_soffice_path) is None
 
   async def _scenario() -> None:
@@ -291,14 +307,13 @@ def test_verifier_toggle_clean_context_readonly_and_unified_rollup(tmp_path: Pat
       {"input_tokens": 180, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1500, "output_tokens": 45},
     ]
 
-    async def _vh(req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+    async def _vh(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
       u, model = usages[n - 1], "google-cloud/claude-opus-5-5"
       if n == 1:
         return (200, "text/event-stream", _sse_reply(calls=[("w1", "write_file", {"path": "calc.txt", "content": "torque = 55"})], finish_reason="tool_calls", usage=u, model=model))
       if n == 2:
         return (200, "text/event-stream", _sse_reply(text="Draft torque written", finish_reason="stop", usage=u, model=model))
       if n == 3:
-        assert [t["function"]["name"] for t in req["json"]["tools"]] == ["bash", "read_file"] and len(req["json"]["messages"]) == 2
         return (200, "text/event-stream", _sse_reply(calls=[("vr1", "read_file", {"path": "calc.txt"})], finish_reason="tool_calls", usage=u, model=model))
       if n == 4:
         return (200, "text/event-stream", _sse_reply(text="VERIFIER_FAIL: 1. Missing N*m unit in calc.txt", finish_reason="stop", usage=u, model=model))
@@ -311,11 +326,230 @@ def test_verifier_toggle_clean_context_readonly_and_unified_rollup(tmp_path: Pat
       env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/claude-opus-5-5", "PLE_ENABLE_VERIFIER": "1"},
     )
     assert len(reqs) == 6 and rollup.get("verifier_runs") == 1
+    assert [t["function"]["name"] for t in reqs[2]["json"]["tools"]] == ["bash", "read_file"]
+    assert len(reqs[2]["json"]["messages"]) == 2
     assert (tmp_path / "calc.txt").read_text(encoding="utf-8") == "torque = 55 N*m\n"
     usage_frames = [f for f in frames if f.get("type") == "usage"]
     assert len(usage_frames) == 6 and evaluate_p2_oracle("google-cloud/claude-opus-5-5", usages, usage_frames, rollup)
 
   asyncio.run(asyncio.wait_for(_scenario(), timeout=8.0))
+
+
+def test_untouched_xlsx_baseline_volatile_today_and_blank_cmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  da = _load_repo_module("deliverable_audit")
+  monkeypatch.setattr(sys, "argv", ["deliverable_audit.py"])
+  assert da._cli() == 2
+  assert da.is_quantitative_optimization_task("Write a qualitative engineering memorandum assessing pipe corrosion.") is False
+  assert da.is_quantitative_optimization_task("Provide a qualitative assessment of heat exchanger fouling.") is False
+
+  work = tmp_path / "work"
+  state = tmp_path / "state"
+  work.mkdir()
+
+  untouched_path = work / "untouched_ref.xlsx"
+  wb_u = xlsxwriter.Workbook(str(untouched_path))
+  ws_u = wb_u.add_worksheet("Ref")
+  ws_u.write_formula("A1", "=TODAY()", None, 46300)
+  wb_u.close()
+  untouched_before = untouched_path.read_bytes()
+
+  corrupt_fixture = work / "corrupt_fixture.xlsx"
+  corrupt_fixture.write_bytes(b"PK\x03\x04corrupt-zip-bytes")
+
+  edit_path = work / "editable.xlsx"
+  wb_e = xlsxwriter.Workbook(str(edit_path))
+  ws_in, ws_c = wb_e.add_worksheet("Inputs"), wb_e.add_worksheet("Calcs")
+  ws_in.write_number("B1", 100.0)
+  ws_in.write_number("B3", 5.0)
+  ws_c.write_formula("C1", "=TODAY()", None, 46342)
+  ws_c.write_formula("C2", '=IF(Inputs!B2="","",Inputs!B1/Inputs!B2)', None, "")
+  ws_c.write_formula("C3", '=IF(Inputs!B3="","",Inputs!B1/Inputs!B3)', None, 20.0)
+  ws_c.write_formula("C4", '=IF(999<"a",IF("z"<TRUE,1,0),0)', None, 1)
+  wb_e.close()
+
+  da.snapshot_workdir(work, state)
+  assert da.is_workdir_dirty(work, state) is False
+  idle_audit = da.audit_workdir(work, state)
+  assert idle_audit["outcome"] == "not_run"
+  assert untouched_path.read_bytes() == untouched_before
+
+  wb_mod = openpyxl.load_workbook(edit_path)
+  wb_mod["Inputs"]["B1"] = 250.0
+  wb_mod.save(edit_path)
+  wb_mod.close()
+
+  assert da.is_workdir_dirty(work, state) is True
+  res = da.audit_workdir(work, state)
+  assert res["outcome"] == "pass", res["findings"]
+  assert untouched_path.read_bytes() == untouched_before
+
+  wb_v = openpyxl.load_workbook(edit_path, data_only=True)
+  try:
+    assert wb_v["Calcs"]["C1"].value == 46342
+    assert wb_v["Calcs"]["C2"].value in ("", None)
+    assert abs(float(wb_v["Calcs"]["C3"].value) - 50.0) < 1e-6
+    assert wb_v["Calcs"]["C4"].value == 1
+  finally:
+    wb_v.close()
+
+
+def test_multi_root_sibling_deliverables_and_small_facts_tolerance(tmp_path: Path) -> None:
+  da = _load_repo_module("deliverable_audit")
+  work = tmp_path / "work"
+  fs_root = tmp_path / "filesystem_sim"
+  state = tmp_path / "state"
+  work.mkdir()
+  fs_root.mkdir()
+
+  ref_xlsx = fs_root / "baseline_ref.xlsx"
+  wb_r = xlsxwriter.Workbook(str(ref_xlsx))
+  ws_r = wb_r.add_worksheet("Sheet1")
+  ws_r.write_formula("A1", "=NOW()", None, 46342.5)
+  wb_r.close()
+  ref_bytes = ref_xlsx.read_bytes()
+
+  da.snapshot_workdir(work, state, extra_roots=[fs_root, fs_root])
+  assert da.is_workdir_dirty(work, state, extra_roots=[fs_root]) is False
+
+  out_xlsx = fs_root / "deliverable.xlsx"
+  wb_o = openpyxl.load_workbook(ref_xlsx)
+  wb_o["Sheet1"]["A1"] = "=15+15"
+  wb_o["Sheet1"]["A2"] = "strain_ratio = 0.0040"
+  wb_o.save(out_xlsx)
+  wb_o.close()
+
+  (state / "facts.json").write_text(json.dumps({"sum_val": 30.0, "strain_ratio": 0.019}), encoding="utf-8")
+  assert da.is_workdir_dirty(work, state, extra_roots=[fs_root]) is True
+
+  bad_res = da.audit_workdir(
+    work,
+    state,
+    delivered_paths=[str(out_xlsx), "/tmp/.ple_work_fake123/scratch.xlsx", str(state / "init.json")],
+    extra_roots=[fs_root],
+  )
+  assert ref_xlsx.read_bytes() == ref_bytes
+  assert bad_res["outcome"] == "flagged"
+  assert any("strain_ratio" in f for f in bad_res["findings"])
+
+  (state / "facts.json").write_text(json.dumps({"sum_val": 30.0, "strain_ratio": 0.004}), encoding="utf-8")
+  ok_res = da.audit_workdir(work, state, delivered_paths=[str(out_xlsx)], extra_roots=[fs_root])
+  assert ok_res["outcome"] == "pass", ok_res["findings"]
+  wb_check = openpyxl.load_workbook(out_xlsx, data_only=True)
+  try:
+    assert wb_check["Sheet1"]["A1"].value == 30
+  finally:
+    wb_check.close()
+
+
+def test_audit_error_resilience_finish_reaudit_and_opt_latch_across_verifier() -> None:
+  taskbridge, harness = _load_repo_module("taskbridge"), _load_repo_module("harness")
+
+  async def _scenario() -> None:
+    logs: list[str] = []
+    exec_calls: list[str] = []
+
+    class _StubSession:
+      def __init__(self, left_val: float | None = 120.0):
+        self.workdir = "/workspace"
+        self.instruction = "Size steel pipe diameter to minimize total capital cost."
+        self.limits: dict[str, Any] = {"exec_timeout_sec": 60}
+        self.mcp_servers: list[dict[str, Any]] = []
+        self.final_message = ""
+        self.cancelled = asyncio.Event()
+        self._left = left_val
+
+      def time_left(self) -> float | None:
+        return self._left
+
+      async def log(self, text: str) -> None:
+        logs.append(text)
+
+      async def usage(self, *_a: Any, **_kw: Any) -> None:
+        return None
+
+      async def write_file(self, _path: str, data: bytes, append: bool = False) -> int:
+        _ = append
+        return len(data)
+
+      async def exec(self, command: str, timeout_sec: int = 120) -> dict[str, Any]:
+        _ = timeout_sec
+        exec_calls.append(command)
+        if "os.replace" in command:
+          return {"ok": True, "exit_code": 0, "output": "", "timed_out": False}
+        if "sleep_timeout_sim" in command:
+          return {"ok": True, "exit_code": 124, "output": "partial", "timed_out": True}
+        if "assert False" in command:
+          return {"ok": True, "exit_code": 1, "output": "AssertionError", "timed_out": False}
+        if len(exec_calls) == 1:
+          return {"ok": True, "exit_code": 1, "output": "no marker", "timed_out": False}
+        return {"ok": True, "exit_code": 0, "output": "__PLE_AUDIT_JSON__:{not-valid-json", "timed_out": False}
+
+    sess = _StubSession(left_val=400.0)
+    ag = harness.Agent(sess)
+    try:
+      f1 = await ag.audit_deliverables()
+      assert f1 == [] and ag.audit_outcome == "error" and ag._audit_staged is False
+      f2 = await ag.audit_deliverables()
+      assert f2 == [] and ag.audit_outcome == "error" and ag._audit_staged is True
+      assert any("[PLE_AUDIT] error" in lg for lg in logs)
+
+      # Pure text without deliverables must NOT enter optimization rounds
+      with _env_scope(PLE_ENABLE_VERIFIER="0"):
+        assert await ag._post_completion_gate("No files produced") is None
+        assert ag.opt_rounds == 0
+
+      # Failing inline assert must NOT set _has_self_checked_opt; timed_out bash marks dirty
+      await ag.bash("python3 -c 'assert False'")
+      assert ag._has_self_checked_opt is False
+      await ag.bash("sleep_timeout_sim")
+      assert ag._workdir_dirty is True and ag._needs_reaudit is True
+
+      # write_file on .py containing 'assert ' sets _has_self_checked_opt, and _opt_converged latches across verifier
+      await ag.write_file("opt_check.py", "x = 2\nassert x > 0\n")
+      assert ag._has_self_checked_opt is True
+
+      async def _fake_audit() -> list[str]:
+        ag._needs_reaudit = False
+        ag.audit_outcome = "pass"
+        return []
+
+      async def _fake_verifier(_txt: str) -> str:
+        ag.verifier_runs += 1
+        return "VERIFIER_FAIL: 1. Add units"
+
+      ag.audit_deliverables = _fake_audit  # type: ignore[method-assign]
+      ag.run_verifier = _fake_verifier  # type: ignore[method-assign]
+      with _env_scope(PLE_ENABLE_VERIFIER="1"):
+        gate1 = await ag._post_completion_gate("OPTIMIZATION_CONVERGED: optimal diameter 0.20 m")
+        assert gate1 is not None and "VERIFIER" in gate1 and ag._opt_converged is True and ag.opt_rounds == 0
+        # Subsequent post-verifier summary without repeating OPTIMIZATION_CONVERGED stays converged
+        gate2 = await ag._post_completion_gate("Added SI units to summary.")
+        assert gate2 is None and ag.opt_rounds == 0
+
+      # finish() runs audit_deliverables when _needs_reaudit is True and left > 60
+      finish_audited = False
+
+      async def _track_audit() -> list[str]:
+        nonlocal finish_audited
+        finish_audited = True
+        ag._needs_reaudit = False
+        return []
+
+      async def _stub_complete(**_kw: Any) -> Any:
+        r = harness.Reply()
+        r.text = "Wrap-up summary"
+        r.finish = "stop"
+        return r
+
+      ag._needs_reaudit = True
+      ag.audit_deliverables = _track_audit  # type: ignore[method-assign]
+      ag.complete = _stub_complete  # type: ignore[method-assign]
+      fin_txt = await ag.finish("Time is almost up.")
+      assert finish_audited is True and "Wrap-up summary" in fin_txt
+    finally:
+      await ag.close()
+
+  asyncio.run(asyncio.wait_for(_scenario(), timeout=5.0))
 
 
 @settings(max_examples=12, deadline=None)
@@ -353,7 +587,7 @@ def test_pbt_p3_ooxml_cached_values_and_error_flagging_guardian(
   frames, _, rollup = asyncio.run(asyncio.wait_for(_run_audit_ws(
     _h, workdir, instruction="Update book.xlsx cells.",
     env={"MODEL_API_KEY": "stub-p3", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_DISABLE_SOFFICE": "1", "PLE_ENABLE_VERIFIER": "0"},
-    exec_path=_path_without_soffice(),
+    exec_path=_path_without_soffice(workdir),
   ), timeout=8.0))
   exp_f = {("Summary", "B1"): "BETA.DIST", ("Summary", "B2"): "ROUND", ("Summary", "B3"): "SUM"}
   exp_v: dict[tuple[str, str], Any] = {("Inputs", "C1"): label, ("Summary", "B1"): seeded_round, ("Summary", "B2"): round(a1_new * a2_round + a3, 4), ("Summary", "B3"): round(a1_new + a2_round + a3, 6)}

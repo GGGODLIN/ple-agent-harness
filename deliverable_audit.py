@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -50,9 +51,13 @@ _OBJ_RE = re.compile(
   r"minimum\s+(?:weight|mass|cost|volume|area|loss|power)|least[-\s]?cost|pareto|paper_score)\b",
   re.IGNORECASE,
 )
-_QUAL_ONLY_RE = re.compile(r"\bqualitative\s+(?:engineering\s+)?memo\b", re.IGNORECASE)
+_QUAL_ONLY_RE = re.compile(
+  r"\bqualitative\s+(?:engineering\s+)?(?:memo|memorandum|review|assessment|analysis|report)\b",
+  re.IGNORECASE,
+)
 _CELL_PART_RE = re.compile(r"^(\$?)([A-Za-z]{1,3})(\$?)([1-9]\d*)$")
 _NUM_SCAN_RE = re.compile(r"(?<![A-Za-z0-9_])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?")
+_SCRATCH_PATH_RE = re.compile(r"^/(?:private/)?tmp/\.ple_work_[^/]+(?:/|$)")
 
 for _pfx, _uri in (
   ("", MAIN_NS),
@@ -275,6 +280,16 @@ def _flatten_nums(val: Any) -> list[float] | str:
   return []
 
 
+def _cmp_key(v: Any) -> tuple[int, Any]:
+  if isinstance(v, bool):
+    return (2, v)
+  if isinstance(v, str):
+    return (1, v.lower())
+  if isinstance(v, (int, float)):
+    return (0, float(v))
+  return (1, str(v).lower())
+
+
 class _FormulaEvaluator:
   """Recursive-descent evaluator over tokenized OOXML cell expressions."""
 
@@ -305,27 +320,38 @@ class _FormulaEvaluator:
     while (p := self._peek()) and p[0] == "OP" and p[1] in ("=", "<>", "<", "<=", ">", ">="):
       op = self._eat()[1]
       right = self._concat()
+      if isinstance(left, list):
+        left = left[0][0] if left and left[0] else None
+      if isinstance(right, list):
+        right = right[0][0] if right and right[0] else None
       if isinstance(left, str) and left in EXCEL_ERRORS:
         return left
       if isinstance(right, str) and right in EXCEL_ERRORS:
         return right
-      lv = 0 if left is None else (left.lower() if isinstance(left, str) else left)
-      rv = 0 if right is None else (right.lower() if isinstance(right, str) else right)
-      try:
-        if op == "=":
-          left = lv == rv
-        elif op == "<>":
-          left = lv != rv
-        elif op == "<":
-          left = lv < rv  # type: ignore[operator]
-        elif op == "<=":
-          left = lv <= rv  # type: ignore[operator]
-        elif op == ">":
-          left = lv > rv  # type: ignore[operator]
-        else:
-          left = lv >= rv  # type: ignore[operator]
-      except TypeError:
-        left = str(lv) < str(rv) if op in ("<", "<=") else str(lv) > str(rv)
+      if left is None and right is None:
+        lv_raw: Any = 0.0
+        rv_raw: Any = 0.0
+      elif left is None:
+        lv_raw = "" if isinstance(right, str) else (False if isinstance(right, bool) else 0.0)
+        rv_raw = right
+      elif right is None:
+        lv_raw = left
+        rv_raw = "" if isinstance(left, str) else (False if isinstance(left, bool) else 0.0)
+      else:
+        lv_raw, rv_raw = left, right
+      lk, rk = _cmp_key(lv_raw), _cmp_key(rv_raw)
+      if op == "=":
+        left = lk == rk
+      elif op == "<>":
+        left = lk != rk
+      elif op == "<":
+        left = lk < rk
+      elif op == "<=":
+        left = lk <= rk
+      elif op == ">":
+        left = lk > rk
+      else:
+        left = lk >= rk
     return left
 
   def _concat(self) -> Any:
@@ -619,52 +645,97 @@ def _extract_xlsx_state(xlsx_path: Path) -> dict[str, Any]:
     return {"sheets": sheets_out}
 
 
-def _scan_files(workdir: Path) -> dict[str, list[int]]:
+def _active_extra_roots(workdir: Path, extra_roots: list[Path] | None) -> list[Path]:
+  w_res = workdir.resolve()
+  if extra_roots is None:
+    fs_dir = Path("/filesystem")
+    raw_roots = [fs_dir] if fs_dir.is_dir() else []
+  else:
+    raw_roots = [Path(r) for r in extra_roots]
+  seen: set[Path] = {w_res}
+  out: list[Path] = []
+  for cand in raw_roots:
+    rp = cand.resolve()
+    if rp not in seen:
+      seen.add(rp)
+      out.append(rp)
+  return out
+
+
+def _scan_files(workdir: Path, state_dir: Path | None = None, *, absolute_keys: bool = False) -> dict[str, list[int]]:
   out: dict[str, list[int]] = {}
   if not workdir.is_dir():
     return out
+  state_res = state_dir.resolve() if state_dir is not None else None
   for root_s, dirs, files in os.walk(workdir):
-    dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".ple_")]
+    root_p = Path(root_s)
+    if state_res is not None:
+      dirs[:] = [
+        d for d in dirs
+        if d not in SKIP_DIRS and not d.startswith(".ple_") and (root_p / d).resolve() != state_res
+      ]
+    else:
+      dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".ple_")]
     for fn in files:
       if fn.startswith("._ple_stage_"):
         continue
-      full = Path(root_s) / fn
+      full = root_p / fn
       try:
         st_info = full.stat()
       except OSError:
         continue
-      rel = full.relative_to(workdir).as_posix()
-      out[rel] = [int(st_info.st_size), int(st_info.st_mtime_ns)]
+      key = full.resolve().as_posix() if absolute_keys else full.relative_to(workdir).as_posix()
+      out[key] = [int(st_info.st_size), int(st_info.st_mtime_ns)]
   return out
 
 
-def snapshot_workdir(workdir: Path, state_dir: Path) -> dict[str, Any]:
+def _scan_all_files(workdir: Path, state_dir: Path, extra_roots: list[Path] | None) -> dict[str, list[int]]:
+  merged = _scan_files(workdir, state_dir, absolute_keys=False)
+  for eroot in _active_extra_roots(workdir, extra_roots):
+    merged.update(_scan_files(eroot, state_dir, absolute_keys=True))
+  return merged
+
+
+def snapshot_workdir(
+  workdir: Path, state_dir: Path, extra_roots: list[Path] | None = None
+) -> dict[str, Any]:
   """Records pre-mutation file metadata and existing `.xlsx` `<v>` baselines in `state_dir/init.json`."""
   state_dir.mkdir(parents=True, exist_ok=True)
   init_file = state_dir / "init.json"
   if init_file.is_file():
-    return json.loads(init_file.read_text(encoding="utf-8"))
-  files = _scan_files(workdir)
+    with contextlib.suppress(OSError, ValueError):
+      loaded = json.loads(init_file.read_text(encoding="utf-8"))
+      if isinstance(loaded, dict):
+        return loaded
+  files = _scan_all_files(workdir, state_dir, extra_roots)
   xlsx_base: dict[str, Any] = {}
   for rel in files:
     if rel.lower().endswith(".xlsx"):
-      xlsx_base[rel] = _extract_xlsx_state(workdir / rel)
+      fpath = Path(rel) if rel.startswith("/") else (workdir / rel)
+      try:
+        xlsx_base[rel] = _extract_xlsx_state(fpath)
+      except (zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, OSError):
+        xlsx_base[rel] = {}
   data = {"files": files, "xlsx": xlsx_base}
   init_file.write_text(json.dumps(data), encoding="utf-8")
   return data
 
 
-def is_workdir_dirty(workdir: Path, state_dir: Path) -> bool:
-  """Returns True when any deliverable or `.xlsx` or `facts.json` exists or changed."""
+def is_workdir_dirty(
+  workdir: Path, state_dir: Path, extra_roots: list[Path] | None = None
+) -> bool:
+  """Returns True when any deliverable or `facts.json` exists or changed across active roots."""
   if (state_dir / "facts.json").is_file() or (workdir / "facts.json").is_file():
     return True
   init_file = state_dir / "init.json"
-  cur = _scan_files(workdir)
-  if any(k.lower().endswith(".xlsx") for k in cur):
-    return True
+  cur = _scan_all_files(workdir, state_dir, extra_roots)
   if not init_file.is_file():
     return bool(cur)
-  base = json.loads(init_file.read_text(encoding="utf-8")).get("files", {})
+  try:
+    init_obj = json.loads(init_file.read_text(encoding="utf-8"))
+    base = init_obj.get("files", {}) if isinstance(init_obj, dict) else {}
+  except (OSError, ValueError):
+    return True
   return cur != base
 
 
@@ -741,137 +812,151 @@ def _patch_xlsx_file(
     return [f"{rel_path}: invalid xlsx archive"], nums, ""
 
   if allow_soffice and os.environ.get("PLE_DISABLE_SOFFICE", "0") != "1" and shutil.which("soffice"):
-    with tempfile.TemporaryDirectory() as tmp_d:
-      proc = subprocess.run(
-        ["soffice", "--headless", "--convert-to", "xlsx", "--outdir", tmp_d, str(xlsx_path)],
-        capture_output=True,
-        timeout=30,
-      )
-      cand = Path(tmp_d) / xlsx_path.name
-      if proc.returncode == 0 and cand.is_file() and zipfile.is_zipfile(cand):
-        stage_so = xlsx_path.parent / f"._ple_stage_soffice_{os.getpid()}"
-        shutil.copyfile(cand, stage_so)
-        os.replace(stage_so, xlsx_path)
-
-  with zipfile.ZipFile(xlsx_path, "r") as zin:
-    if "xl/workbook.xml" not in zin.namelist():
-      return [f"{rel_path}: missing xl/workbook.xml"], nums, ""
-    archive_bytes = {name: zin.read(name) for name in zin.namelist()}
-    shared = _read_shared_strings(zin)
-    targets = _sheet_targets(zin)
-
-  wb_root = ET.fromstring(archive_bytes["xl/workbook.xml"])
-  calc_pr = wb_root.find(f"{{{MAIN_NS}}}calcPr")
-  if calc_pr is None:
-    calc_pr = ET.SubElement(wb_root, f"{{{MAIN_NS}}}calcPr")
-  calc_pr.set("fullCalcOnLoad", "1")
-  archive_bytes["xl/workbook.xml"] = ET.tostring(wb_root, encoding="utf-8", xml_declaration=True)
-
-  known_sheets = {name for name, _ in targets}
-  sheet_trees: dict[str, tuple[str, ET.Element]] = {}
-  cells: dict[tuple[str, str], dict[str, Any]] = {}
-
-  for sh_name, arc in targets:
-    root = ET.fromstring(archive_bytes[arc])
-    sheet_trees[sh_name] = (arc, root)
-    for c_el in root.iter(f"{{{MAIN_NS}}}c"):
-      coord = _norm_coord(c_el.attrib.get("r", ""))
-      if not coord:
-        continue
-      c_t = c_el.attrib.get("t", "")
-      f_el = c_el.find(f"{{{MAIN_NS}}}f")
-      v_el = c_el.find(f"{{{MAIN_NS}}}v")
-      is_el = c_el.find(f"{{{MAIN_NS}}}is")
-      f_txt = (f_el.text or "").strip() if f_el is not None else None
-      raw_v = v_el.text if v_el is not None else None
-      inline_s = "".join(t.text or "" for t in is_el.iter(f"{{{MAIN_NS}}}t")) if is_el is not None else None
-      val = _decode_scalar(c_t, raw_v, inline_s, shared)
-      cells[(sh_name, coord)] = {"el": c_el, "f": f_txt, "v": raw_v, "t": c_t, "val": val, "ready": f_txt is None}
-
-  base_sheets = (baseline_book or {}).get("sheets", {})
-  dirty_memo: dict[tuple[str, str], bool] = {}
-  dirty_visiting: set[tuple[str, str]] = set()
-
-  def _is_cell_dirty(sh: str, coord: str) -> bool:
-    key = (sh, coord)
-    if key in dirty_memo:
-      return dirty_memo[key]
-    if key in dirty_visiting:
-      return True
-    dirty_visiting.add(key)
+    stage_so = xlsx_path.parent / f"._ple_stage_soffice_{os.getpid()}"
     try:
-      b_cell = base_sheets.get(sh, {}).get(coord)
-      cur_cell = cells.get(key)
-      if b_cell is None and cur_cell is None:
-        res_d = False
-      elif b_cell is None or cur_cell is None:
-        res_d = True
-      elif cur_cell["f"] is None:
-        res_d = b_cell.get("f") is not None or cur_cell["val"] != b_cell.get("val")
-      else:
-        bf = b_cell.get("f")
-        if bf is None or cur_cell["f"].strip().lstrip("=") != bf.strip().lstrip("=") or VOLATILE_RE.search(cur_cell["f"]):
-          res_d = True
-        else:
-          refs = _referenced_cells(cur_cell["f"], sh, known_sheets)
-          res_d = True if refs is None else any(_is_cell_dirty(rsh, rc) for rsh, rc in refs)
-      dirty_memo[key] = res_d
-      return res_d
+      with tempfile.TemporaryDirectory() as tmp_d:
+        proc = subprocess.run(
+          ["soffice", "--headless", "--convert-to", "xlsx", "--outdir", tmp_d, str(xlsx_path)],
+          capture_output=True,
+          timeout=30,
+        )
+        cand = Path(tmp_d) / xlsx_path.name
+        if proc.returncode == 0 and cand.is_file() and zipfile.is_zipfile(cand):
+          shutil.copyfile(cand, stage_so)
+          os.replace(stage_so, xlsx_path)
+    except (subprocess.SubprocessError, OSError):
+      pass
     finally:
-      dirty_visiting.discard(key)
-
-  eval_visiting: set[tuple[str, str]] = set()
-
-  def _eval_cell(sh: str, coord: str) -> Any:
-    key = (sh, coord)
-    info = cells.get(key)
-    if info is None:
-      return None
-    if info["ready"]:
-      return info["val"]
-    if key in eval_visiting:
-      return "#REF!"
-    eval_visiting.add(key)
-    try:
-      f_expr = info["f"]
-      assert f_expr is not None
-      if not _is_cell_dirty(sh, coord):
-        if info["v"] not in (None, ""):
-          info["ready"] = True
-          return info["val"]
-        b_cell = base_sheets.get(sh, {}).get(coord, {})
-        if b_cell.get("v") not in (None, ""):
-          b_t = b_cell.get("t") or ""
-          b_val = b_cell.get("val")
-          override = ("str", str(b_val)) if b_t == "s" else (b_t, str(b_cell["v"]))
-          info["val"] = _set_cell_cached_xml(info["el"], b_val, raw_override=override)
-          info["ready"] = True
-          return info["val"]
-      toks = _tokenize_expr(f_expr, sh)
-      computed = _FormulaEvaluator(toks, _eval_cell, known_sheets).parse()
-      info["val"] = _set_cell_cached_xml(info["el"], computed)
-      info["ready"] = True
-      return info["val"]
-    finally:
-      eval_visiting.discard(key)
-
-  for sh_name, coord in list(cells.keys()):
-    val = _eval_cell(sh_name, coord)
-    if isinstance(val, str) and val in EXCEL_ERRORS:
-      findings.append(f"{rel_path}!{sh_name}!{coord}: formula error {val}")
-    elif isinstance(val, (int, float)) and not isinstance(val, bool):
-      nums.append(float(val))
-    elif isinstance(val, str) and val:
-      texts.append(val)
-
-  for sh_name, (arc, root) in sheet_trees.items():
-    archive_bytes[arc] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+      if stage_so.exists():
+        with contextlib.suppress(OSError):
+          stage_so.unlink()
 
   stage_path = xlsx_path.parent / f"._ple_stage_audit_{os.getpid()}"
-  with zipfile.ZipFile(stage_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-    for name, raw in archive_bytes.items():
-      zout.writestr(name, raw)
-  os.replace(stage_path, xlsx_path)
+  try:
+    with zipfile.ZipFile(xlsx_path, "r") as zin:
+      if "xl/workbook.xml" not in zin.namelist():
+        return [f"{rel_path}: missing xl/workbook.xml"], nums, ""
+      archive_bytes = {name: zin.read(name) for name in zin.namelist()}
+      shared = _read_shared_strings(zin)
+      targets = _sheet_targets(zin)
+
+    wb_root = ET.fromstring(archive_bytes["xl/workbook.xml"])
+    calc_pr = wb_root.find(f"{{{MAIN_NS}}}calcPr")
+    if calc_pr is None:
+      calc_pr = ET.SubElement(wb_root, f"{{{MAIN_NS}}}calcPr")
+    calc_pr.set("fullCalcOnLoad", "1")
+    archive_bytes["xl/workbook.xml"] = ET.tostring(wb_root, encoding="utf-8", xml_declaration=True)
+
+    known_sheets = {name for name, _ in targets}
+    sheet_trees: dict[str, tuple[str, ET.Element]] = {}
+    cells: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for sh_name, arc in targets:
+      root = ET.fromstring(archive_bytes[arc])
+      sheet_trees[sh_name] = (arc, root)
+      for c_el in root.iter(f"{{{MAIN_NS}}}c"):
+        coord = _norm_coord(c_el.attrib.get("r", ""))
+        if not coord:
+          continue
+        c_t = c_el.attrib.get("t", "")
+        f_el = c_el.find(f"{{{MAIN_NS}}}f")
+        v_el = c_el.find(f"{{{MAIN_NS}}}v")
+        is_el = c_el.find(f"{{{MAIN_NS}}}is")
+        f_txt = (f_el.text or "").strip() if f_el is not None else None
+        raw_v = v_el.text if v_el is not None else None
+        inline_s = "".join(t.text or "" for t in is_el.iter(f"{{{MAIN_NS}}}t")) if is_el is not None else None
+        val = _decode_scalar(c_t, raw_v, inline_s, shared)
+        cells[(sh_name, coord)] = {"el": c_el, "f": f_txt, "v": raw_v, "t": c_t, "val": val, "ready": f_txt is None}
+
+    base_sheets = (baseline_book or {}).get("sheets", {})
+    dirty_memo: dict[tuple[str, str], bool] = {}
+    dirty_visiting: set[tuple[str, str]] = set()
+
+    def _is_cell_dirty(sh: str, coord: str) -> bool:
+      key = (sh, coord)
+      if key in dirty_memo:
+        return dirty_memo[key]
+      if key in dirty_visiting:
+        return True
+      dirty_visiting.add(key)
+      try:
+        b_cell = base_sheets.get(sh, {}).get(coord)
+        cur_cell = cells.get(key)
+        if b_cell is None and cur_cell is None:
+          res_d = False
+        elif b_cell is None or cur_cell is None:
+          res_d = True
+        elif cur_cell["f"] is None:
+          res_d = b_cell.get("f") is not None or cur_cell["val"] != b_cell.get("val")
+        else:
+          bf = b_cell.get("f")
+          if bf is None or cur_cell["f"].strip().lstrip("=") != bf.strip().lstrip("="):
+            res_d = True
+          else:
+            refs = _referenced_cells(cur_cell["f"], sh, known_sheets)
+            res_d = True if refs is None else any(_is_cell_dirty(rsh, rc) for rsh, rc in refs)
+        dirty_memo[key] = res_d
+        return res_d
+      finally:
+        dirty_visiting.discard(key)
+
+    eval_visiting: set[tuple[str, str]] = set()
+
+    def _eval_cell(sh: str, coord: str) -> Any:
+      key = (sh, coord)
+      info = cells.get(key)
+      if info is None:
+        return None
+      if info["ready"]:
+        return info["val"]
+      if key in eval_visiting:
+        return "#REF!"
+      eval_visiting.add(key)
+      try:
+        f_expr = info["f"]
+        assert f_expr is not None
+        if not _is_cell_dirty(sh, coord):
+          if info["v"] not in (None, ""):
+            info["ready"] = True
+            return info["val"]
+          b_cell = base_sheets.get(sh, {}).get(coord, {})
+          if b_cell.get("v") not in (None, ""):
+            b_t = b_cell.get("t") or ""
+            b_val = b_cell.get("val")
+            override = ("str", str(b_val)) if b_t == "s" else (b_t, str(b_cell["v"]))
+            info["val"] = _set_cell_cached_xml(info["el"], b_val, raw_override=override)
+            info["ready"] = True
+            return info["val"]
+        toks = _tokenize_expr(f_expr, sh)
+        computed = _FormulaEvaluator(toks, _eval_cell, known_sheets).parse()
+        info["val"] = _set_cell_cached_xml(info["el"], computed)
+        info["ready"] = True
+        return info["val"]
+      finally:
+        eval_visiting.discard(key)
+
+    for sh_name, coord in list(cells.keys()):
+      val = _eval_cell(sh_name, coord)
+      if isinstance(val, str) and val in EXCEL_ERRORS:
+        findings.append(f"{rel_path}!{sh_name}!{coord}: formula error {val}")
+      elif isinstance(val, (int, float)) and not isinstance(val, bool):
+        nums.append(float(val))
+      elif isinstance(val, str) and val:
+        texts.append(val)
+        nums.extend(_extract_nums_from_text(val))
+
+    for sh_name, (arc, root) in sheet_trees.items():
+      archive_bytes[arc] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    with zipfile.ZipFile(stage_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+      for name, raw in archive_bytes.items():
+        zout.writestr(name, raw)
+    os.replace(stage_path, xlsx_path)
+  except (zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, RecursionError, OSError) as exc:
+    if stage_path.exists():
+      with contextlib.suppress(OSError):
+        stage_path.unlink()
+    return [f"{rel_path}: xlsx audit error ({type(exc).__name__})"], nums, ""
   return findings, nums, "\n".join(texts)
 
 
@@ -886,26 +971,49 @@ def _extract_nums_from_text(text: str) -> list[float]:
 
 
 def audit_workdir(
-  workdir: Path, state_dir: Path, delivered_paths: list[str] | None = None
+  workdir: Path,
+  state_dir: Path,
+  delivered_paths: list[str] | None = None,
+  extra_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
   """Audits produced deliverables, patches `.xlsx` `<v>` caches, and cross-checks `facts.json`."""
   init_file = state_dir / "init.json"
-  init_data = json.loads(init_file.read_text(encoding="utf-8")) if init_file.is_file() else {"files": {}, "xlsx": {}}
-  base_files: dict[str, list[int]] = init_data.get("files", {})
-  base_xlsx: dict[str, Any] = init_data.get("xlsx", {})
-  cur_files = _scan_files(workdir)
+  init_data: dict[str, Any] = {"files": {}, "xlsx": {}}
+  if init_file.is_file():
+    with contextlib.suppress(OSError, ValueError):
+      parsed_init = json.loads(init_file.read_text(encoding="utf-8"))
+      if isinstance(parsed_init, dict):
+        init_data = parsed_init
+  base_files: dict[str, list[int]] = init_data.get("files", {}) if isinstance(init_data.get("files"), dict) else {}
+  base_xlsx: dict[str, Any] = init_data.get("xlsx", {}) if isinstance(init_data.get("xlsx"), dict) else {}
+  cur_files = _scan_all_files(workdir, state_dir, extra_roots)
 
   candidate_rels: set[str] = set()
+  alias_paths: dict[str, list[str]] = {}
   for rel, meta in cur_files.items():
-    if rel not in base_files or base_files[rel] != meta or rel.lower().endswith(".xlsx"):
+    if rel not in base_files or base_files[rel] != meta:
       candidate_rels.add(rel)
+
+  w_res = workdir.resolve()
+  s_res = state_dir.resolve()
   for p_str in delivered_paths or []:
-    p = Path(p_str)
-    try:
-      rel = p.resolve().relative_to(workdir.resolve()).as_posix()
-      candidate_rels.add(rel)
-    except ValueError:
+    norm_raw = posixpath.normpath(p_str)
+    if _SCRATCH_PATH_RE.match(norm_raw):
       continue
+    p = Path(p_str) if Path(p_str).is_absolute() else (workdir / p_str)
+    try:
+      p_res = p.resolve()
+    except OSError:
+      continue
+    if p_res == s_res or p_res.is_relative_to(s_res) or _SCRATCH_PATH_RE.match(p_res.as_posix()):
+      continue
+    try:
+      rel = p_res.relative_to(w_res).as_posix()
+    except ValueError:
+      rel = p_res.as_posix()
+    if rel and rel != ".":
+      candidate_rels.add(rel)
+      alias_paths.setdefault(rel, []).append(p_str)
 
   findings: list[str] = []
   doc_records: list[tuple[str, list[float], str]] = []
@@ -914,51 +1022,61 @@ def audit_workdir(
   for rel in sorted(candidate_rels):
     if rel == "facts.json":
       continue
-    fpath = workdir / rel
+    fpath = Path(rel) if rel.startswith("/") else (workdir / rel)
     if not fpath.is_file():
       findings.append(f"{rel}: missing deliverable file")
       continue
-    sz = fpath.stat().st_size
+    try:
+      sz = fpath.stat().st_size
+    except OSError as exc:
+      findings.append(f"{rel}: stat failed ({type(exc).__name__})")
+      continue
     if sz == 0:
       findings.append(f"{rel}: empty deliverable (0 bytes)")
       continue
     low = rel.lower()
+    final_sz = sz
     if low.endswith(".xlsx"):
       f_errs, nums, txts = _patch_xlsx_file(fpath, rel, base_xlsx.get(rel), allow_soffice=True)
       findings.extend(f_errs)
       doc_records.append((rel, nums, txts))
-      sizes[str(fpath)] = fpath.stat().st_size
+      with contextlib.suppress(OSError):
+        final_sz = fpath.stat().st_size
     elif low.endswith(".docx"):
       if not zipfile.is_zipfile(fpath):
         findings.append(f"{rel}: invalid docx archive")
       else:
-        with zipfile.ZipFile(fpath, "r") as zf:
-          if "word/document.xml" not in zf.namelist():
-            findings.append(f"{rel}: missing word/document.xml")
-          else:
-            wroot = ET.fromstring(zf.read("word/document.xml"))
-            wtxt = " ".join(t.text or "" for t in wroot.iter(f"{{{WORD_NS}}}t"))
-            doc_records.append((rel, _extract_nums_from_text(wtxt), wtxt))
-      sizes[str(fpath)] = fpath.stat().st_size
+        try:
+          with zipfile.ZipFile(fpath, "r") as zf:
+            if "word/document.xml" not in zf.namelist():
+              findings.append(f"{rel}: missing word/document.xml")
+            else:
+              wroot = ET.fromstring(zf.read("word/document.xml"))
+              wtxt = " ".join(t.text or "" for t in wroot.iter(f"{{{WORD_NS}}}t"))
+              doc_records.append((rel, _extract_nums_from_text(wtxt), wtxt))
+        except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError) as exc:
+          findings.append(f"{rel}: docx audit error ({type(exc).__name__})")
     elif low.endswith(".pdf"):
       head_b = fpath.read_bytes()[:1024]
       if b"%PDF-" not in head_b:
         findings.append(f"{rel}: invalid PDF header")
-      sizes[str(fpath)] = sz
     elif low.endswith(".json"):
       raw_t = fpath.read_text(encoding="utf-8", errors="replace")
       try:
         json.loads(raw_t)
       except ValueError as exc:
         findings.append(f"{rel}: invalid JSON ({exc})")
-      doc_records.append((rel, _extract_nums_from_text(raw_t), raw_t))
-      sizes[str(fpath)] = sz
-    else:
-      raw_b = fpath.read_bytes()
-      if b"\0" not in raw_b[:4096]:
-        raw_t = raw_b.decode("utf-8", errors="replace")
+      if sz <= 2 * 1024 * 1024:
         doc_records.append((rel, _extract_nums_from_text(raw_t), raw_t))
-      sizes[str(fpath)] = sz
+    else:
+      if sz <= 2 * 1024 * 1024:
+        raw_b = fpath.read_bytes()
+        if b"\0" not in raw_b[:4096]:
+          raw_t = raw_b.decode("utf-8", errors="replace")
+          doc_records.append((rel, _extract_nums_from_text(raw_t), raw_t))
+    sizes[str(fpath)] = final_sz
+    for orig_p in alias_paths.get(rel, ()):
+      sizes[orig_p] = final_sz
 
   facts_file = state_dir / "facts.json"
   if not facts_file.is_file() and (workdir / "facts.json").is_file():
@@ -973,7 +1091,7 @@ def audit_workdir(
           fk_spaced = fk_str.lower().replace("_", " ")
           if isinstance(fv, (int, float)) and not isinstance(fv, bool):
             target_f = float(fv)
-            tol = max(0.02, abs(target_f) * 2e-3)
+            tol = max(1e-6, abs(target_f) * 2e-3) if abs(target_f) < 1.0 else max(0.02, abs(target_f) * 2e-3)
             any_hit = False
             for d_rel, d_nums, d_txt in doc_records:
               hit = any(abs(x - target_f) <= tol for x in d_nums)
@@ -997,6 +1115,8 @@ def audit_workdir(
 
 
 def _cli() -> int:
+  if len(sys.argv) < 4:
+    return 2
   mode = sys.argv[1]
   workdir = Path(sys.argv[2])
   state_dir = Path(sys.argv[3])

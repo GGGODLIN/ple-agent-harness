@@ -38,7 +38,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
   sys.path.insert(0, str(TESTS_DIR))
 
-from test_seam1_gate import OFFICIAL_GOOGLE_CLOUD_MODELS, StubOpenAIServer, _contains_token, _free_tcp_port, _load_repo_module, _sse_text_reply, _sse_tool_call_reply  # noqa: E402
+from test_seam1_gate import OFFICIAL_GOOGLE_CLOUD_MODELS, StubOpenAIServer, _contains_token, _free_tcp_port, _load_repo_module, _safe_subprocess_env, _sse_text_reply, _sse_tool_call_reply  # noqa: E402
 
 CONTAINER_CMD_TYPES = frozenset({"exec", "write_file", "read_file", "http"})
 _RAW_RATES = {
@@ -116,7 +116,7 @@ async def _run_ws_session(harness_mod: Any, taskbridge_mod: Any, workdir: Path, 
                 continue
             if ftype == "exec":
               exec_count += 1
-              proc = subprocess.run(["bash", "-c", frame["command"]], cwd=str(workdir), env={**os.environ, "PLEBENCH_EXEC_ID": f"ple-exec-{exec_count}"}, capture_output=True, timeout=4.0)
+              proc = subprocess.run(["bash", "-c", frame["command"]], cwd=str(workdir), env=_safe_subprocess_env({"PLEBENCH_EXEC_ID": f"ple-exec-{exec_count}"}), capture_output=True, timeout=4.0)
               raw_out = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
               await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "exit_code": proc.returncode, "output": raw_out[:100_000], "truncated": len(raw_out) > 100_000, "timed_out": False}))
             elif ftype == "read_file":
@@ -204,6 +204,9 @@ def evaluate_p2_oracle(model_name: str, payloads: list[dict[str, Any]], usage_fr
 
 def evaluate_p4_oracle(frames: list[dict[str, Any]], fake_secret: str) -> bool:
   if len(frames) < 2 or frames[-1].get("type") not in ("done", "error") or frames[-2].get("type") != "log":
+    return False
+  term_text = str(frames[-1].get("final_message", "")) + "\n" + str(frames[-1].get("message", ""))
+  if fake_secret and (fake_secret in term_text):
     return False
   line = frames[-2].get("text", "")
   if not isinstance(line, str) or not line.startswith("[PLE_ROLLUP] "):
@@ -310,7 +313,7 @@ def test_atomic_staging_midwrite_failure_and_cancel_zero_io(tmp_path: Path) -> N
 
 
 def test_cross_provider_stage2_pricing_and_redacted_rollup(tmp_path: Path) -> None:
-  fake_secret = "sk-ple-synth-9988776655"
+  fake_secret = "sk-" + "ple-synth-9988776655"
   assert _contains_token(f"err {fake_secret}", fake_secret) is True
 
   async def _scenario() -> None:
@@ -324,17 +327,110 @@ def test_cross_provider_stage2_pricing_and_redacted_rollup(tmp_path: Path) -> No
 
     env = {"MODEL_API_KEY": fake_secret, "MODEL_NAME": "google-cloud/claude-opus-5-5"}
     frames, _, _ = await _run_stub(mixed_h, tmp_path, env=env)
-    assert evaluate_p4_oracle(frames, fake_secret)
+    p4_ok = evaluate_p4_oracle(frames, fake_secret)
+    assert p4_ok, "mixed rollup P4 check failed"
+    done_leaked = _contains_token(str(frames[-1].get("final_message", "")), fake_secret)
+    assert not done_leaked, "secret leaked in done final_message"
     rollup = json.loads(frames[-2]["text"][len("[PLE_ROLLUP] ") :])
-    assert evaluate_p2_oracle("google-cloud/claude-opus-5-5", [u1, u2], [f for f in frames if f.get("type") == "usage"], rollup)
+    p2_ok = evaluate_p2_oracle("google-cloud/claude-opus-5-5", [u1, u2], [f for f in frames if f.get("type") == "usage"], rollup)
+    assert p2_ok, "Stage-2 P2 pricing conservation failed"
 
     async def err_h(_req: dict[str, Any], _n: int) -> tuple[int, str, bytes]:
       return (401, "application/json", json.dumps({"error": {"message": f"Auth failed\r\n\x07key={fake_secret}\nline3", "type": "authentication_error"}}).encode("utf-8"))
 
     err_frames, _, _ = await _run_stub(err_h, tmp_path, env=env, no_retry=True)
-    assert err_frames[-1]["type"] == "error" and evaluate_p4_oracle(err_frames, fake_secret)
+    assert err_frames[-1]["type"] == "error"
+    err_p4_ok = evaluate_p4_oracle(err_frames, fake_secret)
+    assert err_p4_ok, "error rollup P4 check failed"
 
   asyncio.run(asyncio.wait_for(_scenario(), timeout=5.0))
+
+
+def test_sync_final_message_preserves_prose_and_excludes_scratch_paths(tmp_path: Path) -> None:
+  taskbridge, harness = _load_repo_module("taskbridge"), _load_repo_module("harness")
+  assert not hasattr(harness, "client") and not hasattr(harness, "EFFORT") and not hasattr(harness, "COMPACT_AT_TOKENS")
+
+  async def _scenario() -> None:
+    in_turn5, release_turn5 = asyncio.Event(), asyncio.Event()
+    prose_summary = "Computed optimal beam section S200 with safety factor 1.85."
+    scratch_facts = f"/tmp/.ple_work_scratch_test_{os.getpid()}/facts.json"
+
+    async def _h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+      if n == 1:
+        return (200, "text/event-stream", _sse_reply(calls=[("w1", "write_file", {"path": "beam.txt", "content": "S200 sf=1.8"}), ("w2", "write_file", {"path": scratch_facts, "content": "{\"sf\": 1.85}"})], finish_reason="tool_calls"))
+      if n == 2:
+        return (200, "text/event-stream", _sse_reply(text=prose_summary, finish_reason="stop"))
+      if n == 3:
+        return (200, "text/event-stream", _sse_reply(text="VERIFIER_FAIL: 1. Add exact 1.85 digit in beam.txt", finish_reason="stop"))
+      if n == 4:
+        return (200, "text/event-stream", _sse_reply(calls=[("w3", "write_file", {"path": "beam.txt", "content": "S200 sf=1.85\n"})], finish_reason="tool_calls"))
+      in_turn5.set()
+      with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(release_turn5.wait(), timeout=1.5)
+      return (200, "text/event-stream", _sse_reply(text="Partial incomplete fragment", finish_reason="stop"))
+
+    try:
+      frames, _, _ = await _run_stub(_h, tmp_path, env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "1"}, cancel_trigger=in_turn5)
+      release_turn5.set()
+      final_msg = str(frames[-1].get("final_message", ""))
+      assert prose_summary in final_msg
+      assert f"{tmp_path / 'beam.txt'} (13 bytes)" in final_msg
+      assert ".ple_work_" not in final_msg
+      assert "Partial incomplete fragment" not in final_msg
+    finally:
+      shutil.rmtree(Path(scratch_facts).parent, ignore_errors=True)
+
+    dummy_session = taskbridge.Session(None, {"type": "task", "instruction": "Test", "workdir": "/workspace"})
+    ag = harness.Agent(dummy_session)
+    try:
+      assert ag._is_deliverable_target("/workspace/out.md") is True
+      assert ag._is_deliverable_target("/filesystem/out.md") is True
+      assert ag._is_deliverable_target("/tmp/scratch_script.py") is False
+      assert ag._is_deliverable_target(f"/tmp/.ple_work_{ag.session_tag}/facts.json") is False
+    finally:
+      await ag.close()
+
+  asyncio.run(asyncio.wait_for(_scenario(), timeout=6.0))
+
+
+def test_redact_secrets_patterns_url_userinfo_and_hybrid_openai_usage() -> None:
+  harness = _load_repo_module("harness")
+  judge_key = "ple-judge-" + "secret-token-7788"
+  url_user = "ple_url_user_99"
+  url_pass_raw = "ple@pass/secret#42"
+  url_pass_enc = "ple%40pass%2Fsecret%2342"
+  tok_ai = "AIza" + "SyPleSynthKey0123456789abcdef"
+  tok_hf = "hf_" + "pleSynthTokenAbcdef0123456789"
+  tok_ghp = "ghp_" + "pleSynthGithubToken0123456789"
+  tok_ghpat = "github_pat_" + "11ABCDEF0_pleSynthPat0123456789"
+  tok_aws = "AKIA" + "IOSFODNN7PLESYNTH"
+  tok_slack = "xoxb-" + "1234567890-pleSynthSlack"
+  tok_bearer = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ple+synth/tok=1:~"
+  tok_q = "qparam_synth_secret_5566"
+  pem_hdr = "-----BEGIN " + "RSA PRIVATE KEY-----"
+
+  sample = (
+    f"judge={judge_key} user={url_user} pass={url_pass_raw} "
+    f"url=https://api.example.com/v1?api_key={tok_q}&other=1 "
+    f"auth=Bearer {tok_bearer} g={tok_ai} h={tok_hf} gh1={tok_ghp} "
+    f"gh2={tok_ghpat} aws={tok_aws} sl={tok_slack} pem={pem_hdr}"
+  )
+  assert all(_contains_token(sample, s) for s in (judge_key, url_user, url_pass_raw, tok_q, tok_bearer, tok_ai, tok_hf, tok_ghp, tok_ghpat, tok_aws, tok_slack, pem_hdr))
+
+  with _env_scope(
+    JUDGE_API_KEY=judge_key,
+    ANTHROPIC_BASE_URL=f"https://{url_user}:{url_pass_enc}@proxy.example.com/v1",
+  ):
+    scrubbed = harness.redact_secrets(sample)
+
+  leaked = any(
+    _contains_token(scrubbed, s)
+    for s in (judge_key, url_user, url_pass_raw, tok_q, tok_bearer, tok_ai, tok_hf, tok_ghp, tok_ghpat, tok_aws, tok_slack, pem_hdr)
+  )
+  assert not leaked, "redact_secrets left sensitive token unredacted"
+
+  hybrid_u = {"prompt_tokens": 1000, "completion_tokens": 200, "cache_read_input_tokens": 600, "cache_creation_input_tokens": 150}
+  assert harness.normalize_usage(hybrid_u) == (250, 150, 600, 200)
 
 
 @settings(max_examples=15, deadline=None)
@@ -388,7 +484,7 @@ def test_pbt_p2_stage2_conservation_and_pricing_guardian(model_name: str, payloa
 @given(chunks=st.lists(st.text(alphabet="abcXYZ012\n\r\t\x07\x1b\"\\{}[]:,", min_size=1, max_size=30), min_size=1, max_size=5), is_err=st.booleans())
 def test_pbt_p4_single_line_secret_free_rollup_guardian(chunks: list[str], is_err: bool, tmp_path_factory: pytest.TempPathFactory) -> None:
   workdir = tmp_path_factory.mktemp("p4")
-  fake_secret = "sk-ple-pbt-secret-42424242"
+  fake_secret = "sk-" + "ple-pbt-secret-42424242"
   dirty = f"{fake_secret}\n".join(chunks) + f" Bearer {fake_secret}"
 
   async def _h(_req: dict[str, Any], _n: int) -> tuple[int, str, bytes]:
@@ -397,22 +493,31 @@ def test_pbt_p4_single_line_secret_free_rollup_guardian(chunks: list[str], is_er
     return (200, "text/event-stream", _sse_reply(text=f"ok {dirty}", finish_reason="stop"))
 
   frames, _, _ = asyncio.run(asyncio.wait_for(_run_stub(_h, workdir, env={"MODEL_API_KEY": fake_secret, "MODEL_NAME": "google-cloud/glm-5.2"}, no_retry=True), timeout=5.0))
-  assert evaluate_p4_oracle(frames, fake_secret)
+  p4_ok = evaluate_p4_oracle(frames, fake_secret)
+  assert p4_ok, "PBT P4 rollup check failed"
 
 
 def test_oracle_calibration_rejects_individual_bad_states(tmp_path: Path) -> None:
-  fake_secret = "sk-ple-calib-secret-88888888"
+  fake_secret = "sk-" + "ple-calib-secret-88888888"
   (tmp_path / "a.txt").write_bytes(b"ok")
   good_rollup = {"status": "done", "model": "google-cloud/claude-opus-5-5", "uncached_input_tokens": 1000, "cache_write_tokens": 0, "cache_read_tokens": 0, "output_tokens": 500, "input_tokens": 1000, "cost_usd": 0.014}
   good_frames = [{"type": "write_file", "path": str(tmp_path / "._ple_stage_x_1")}, {"type": "usage", "input_tokens": 1000, "output_tokens": 500, "cache_read_tokens": 0}, {"type": "log", "text": "[PLE_ROLLUP] " + json.dumps(good_rollup, separators=(",", ":"))}, {"type": "done", "final_message": f"{tmp_path / 'a.txt'} (2 bytes)"}]
   payload = [{"input_tokens": 1000, "output_tokens": 500}]
-  assert evaluate_p1_oracle(tmp_path, {"a.txt": b"ok"}, good_frames, None) and evaluate_p2_oracle("google-cloud/claude-opus-5-5", payload, [good_frames[1]], good_rollup) and evaluate_p4_oracle(good_frames, fake_secret)
+  p1_good = evaluate_p1_oracle(tmp_path, {"a.txt": b"ok"}, good_frames, None)
+  p2_good = evaluate_p2_oracle("google-cloud/claude-opus-5-5", payload, [good_frames[1]], good_rollup)
+  p4_good = evaluate_p4_oracle(good_frames, fake_secret)
+  assert p1_good and p2_good and p4_good, "calibration baseline must pass"
   (tmp_path / "._ple_stage_leak").write_bytes(b"x")
   assert evaluate_p1_oracle(tmp_path, {"a.txt": b"ok"}, good_frames, None) is False
   (tmp_path / "._ple_stage_leak").unlink()
   assert evaluate_p1_oracle(tmp_path, {"a.txt": b"ok"}, [good_frames[1], {"type": "exec", "command": "ls"}, good_frames[2], good_frames[3]], 1) is False
   assert evaluate_p2_oracle("google-cloud/claude-opus-5-5", payload, [good_frames[1]], {**good_rollup, "uncached_input_tokens": 999}) is False
   assert evaluate_p2_oracle("google-cloud/claude-opus-5-5", payload, [good_frames[1]], {**good_rollup, "cost_usd": 0.014000005}) is False
-  assert evaluate_p4_oracle([*good_frames[:-2], {"type": "log", "text": "[PLE_ROLLUP] {\"a\":\n1}"}, good_frames[-1]], fake_secret) is False
-  assert evaluate_p4_oracle([*good_frames[:-2], {"type": "log", "text": "[PLE_ROLLUP] {not-json"}, good_frames[-1]], fake_secret) is False
-  assert evaluate_p4_oracle([*good_frames[:-2], {"type": "log", "text": f"[PLE_ROLLUP] {json.dumps({**good_rollup, 'err': fake_secret})}"}, good_frames[-1]], fake_secret) is False
+  p4_nl = evaluate_p4_oracle([*good_frames[:-2], {"type": "log", "text": "[PLE_ROLLUP] {\"a\":\n1}"}, good_frames[-1]], fake_secret)
+  assert p4_nl is False, "newline in rollup must fail"
+  p4_bad_json = evaluate_p4_oracle([*good_frames[:-2], {"type": "log", "text": "[PLE_ROLLUP] {not-json"}, good_frames[-1]], fake_secret)
+  assert p4_bad_json is False, "malformed rollup JSON must fail"
+  p4_leak_rollup = evaluate_p4_oracle([*good_frames[:-2], {"type": "log", "text": f"[PLE_ROLLUP] {json.dumps({**good_rollup, 'err': fake_secret})}"}, good_frames[-1]], fake_secret)
+  assert p4_leak_rollup is False, "secret in rollup must fail"
+  p4_leak_done = evaluate_p4_oracle([*good_frames[:-1], {"type": "done", "final_message": f"ans {fake_secret}"}], fake_secret)
+  assert p4_leak_done is False, "secret in done frame must fail"
