@@ -37,7 +37,6 @@ WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 EXCEL_ERRORS = frozenset({"#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#NUM!", "#N/A", "#NULL!"})
 SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", ".mypy_cache"})
-VOLATILE_RE = re.compile(r"\b(?:RAND|RANDBETWEEN|NOW|TODAY)\s*\(", re.IGNORECASE)
 
 _PARAM_RE = re.compile(
   r"\b(?:siz(?:e|ing)|select(?:ion)?|parameters?|diameter|thickness|section|schedule|"
@@ -617,6 +616,20 @@ def _decode_scalar(c_t: str, raw_v: str | None, inline_s: str | None, shared: li
     return raw_v
 
 
+def _parse_cell_xml(c_el: ET.Element, shared: list[str]) -> tuple[str, dict[str, Any]] | None:
+  coord = _norm_coord(c_el.attrib.get("r", ""))
+  if not coord:
+    return None
+  c_t = c_el.attrib.get("t", "")
+  f_el = c_el.find(f"{{{MAIN_NS}}}f")
+  v_el = c_el.find(f"{{{MAIN_NS}}}v")
+  is_el = c_el.find(f"{{{MAIN_NS}}}is")
+  f_txt = (f_el.text or "").strip() if f_el is not None else None
+  raw_v = v_el.text if v_el is not None else None
+  inline_s = "".join(t.text or "" for t in is_el.iter(f"{{{MAIN_NS}}}t")) if is_el is not None else None
+  return coord, {"f": f_txt, "v": raw_v, "t": c_t, "val": _decode_scalar(c_t, raw_v, inline_s, shared)}
+
+
 def _extract_xlsx_state(xlsx_path: Path) -> dict[str, Any]:
   if not zipfile.is_zipfile(xlsx_path):
     return {}
@@ -629,18 +642,9 @@ def _extract_xlsx_state(xlsx_path: Path) -> dict[str, Any]:
       root = ET.fromstring(zf.read(arc))
       cells_out: dict[str, Any] = {}
       for c_el in root.iter(f"{{{MAIN_NS}}}c"):
-        coord = _norm_coord(c_el.attrib.get("r", ""))
-        if not coord:
-          continue
-        c_t = c_el.attrib.get("t", "")
-        f_el = c_el.find(f"{{{MAIN_NS}}}f")
-        v_el = c_el.find(f"{{{MAIN_NS}}}v")
-        is_el = c_el.find(f"{{{MAIN_NS}}}is")
-        f_txt = (f_el.text or "").strip() if f_el is not None else None
-        raw_v = v_el.text if v_el is not None else None
-        inline_s = "".join(t.text or "" for t in is_el.iter(f"{{{MAIN_NS}}}t")) if is_el is not None else None
-        val = _decode_scalar(c_t, raw_v, inline_s, shared)
-        cells_out[coord] = {"f": f_txt, "v": raw_v, "t": c_t, "val": val}
+        parsed = _parse_cell_xml(c_el, shared)
+        if parsed is not None:
+          cells_out[parsed[0]] = parsed[1]
       sheets_out[sh_name] = cells_out
     return {"sheets": sheets_out}
 
@@ -662,20 +666,17 @@ def _active_extra_roots(workdir: Path, extra_roots: list[Path] | None) -> list[P
   return out
 
 
-def _scan_files(workdir: Path, state_dir: Path | None = None, *, absolute_keys: bool = False) -> dict[str, list[int]]:
+def _scan_files(workdir: Path, state_dir: Path, *, absolute_keys: bool = False) -> dict[str, list[int]]:
   out: dict[str, list[int]] = {}
   if not workdir.is_dir():
     return out
-  state_res = state_dir.resolve() if state_dir is not None else None
+  state_res = state_dir.resolve()
   for root_s, dirs, files in os.walk(workdir):
     root_p = Path(root_s)
-    if state_res is not None:
-      dirs[:] = [
-        d for d in dirs
-        if d not in SKIP_DIRS and not d.startswith(".ple_") and (root_p / d).resolve() != state_res
-      ]
-    else:
-      dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".ple_")]
+    dirs[:] = [
+      d for d in dirs
+      if d not in SKIP_DIRS and not d.startswith(".ple_") and (root_p / d).resolve() != state_res
+    ]
     for fn in files:
       if fn.startswith("._ple_stage_"):
         continue
@@ -802,7 +803,7 @@ def _set_cell_cached_xml(c_el: ET.Element, res: Any, raw_override: tuple[str, st
 
 
 def _patch_xlsx_file(
-  xlsx_path: Path, rel_path: str, baseline_book: dict[str, Any] | None, allow_soffice: bool
+  xlsx_path: Path, rel_path: str, baseline_book: dict[str, Any] | None
 ) -> tuple[list[str], list[float], str]:
   findings: list[str] = []
   nums: list[float] = []
@@ -811,7 +812,7 @@ def _patch_xlsx_file(
   if not zipfile.is_zipfile(xlsx_path):
     return [f"{rel_path}: invalid xlsx archive"], nums, ""
 
-  if allow_soffice and os.environ.get("PLE_DISABLE_SOFFICE", "0") != "1" and shutil.which("soffice"):
+  if shutil.which("soffice"):
     stage_so = xlsx_path.parent / f"._ple_stage_soffice_{os.getpid()}"
     try:
       with tempfile.TemporaryDirectory() as tmp_d:
@@ -855,18 +856,10 @@ def _patch_xlsx_file(
       root = ET.fromstring(archive_bytes[arc])
       sheet_trees[sh_name] = (arc, root)
       for c_el in root.iter(f"{{{MAIN_NS}}}c"):
-        coord = _norm_coord(c_el.attrib.get("r", ""))
-        if not coord:
-          continue
-        c_t = c_el.attrib.get("t", "")
-        f_el = c_el.find(f"{{{MAIN_NS}}}f")
-        v_el = c_el.find(f"{{{MAIN_NS}}}v")
-        is_el = c_el.find(f"{{{MAIN_NS}}}is")
-        f_txt = (f_el.text or "").strip() if f_el is not None else None
-        raw_v = v_el.text if v_el is not None else None
-        inline_s = "".join(t.text or "" for t in is_el.iter(f"{{{MAIN_NS}}}t")) if is_el is not None else None
-        val = _decode_scalar(c_t, raw_v, inline_s, shared)
-        cells[(sh_name, coord)] = {"el": c_el, "f": f_txt, "v": raw_v, "t": c_t, "val": val, "ready": f_txt is None}
+        parsed = _parse_cell_xml(c_el, shared)
+        if parsed is not None:
+          coord, info = parsed
+          cells[(sh_name, coord)] = {"el": c_el, **info, "ready": info["f"] is None}
 
     base_sheets = (baseline_book or {}).get("sheets", {})
     dirty_memo: dict[tuple[str, str], bool] = {}
@@ -1037,7 +1030,7 @@ def audit_workdir(
     low = rel.lower()
     final_sz = sz
     if low.endswith(".xlsx"):
-      f_errs, nums, txts = _patch_xlsx_file(fpath, rel, base_xlsx.get(rel), allow_soffice=True)
+      f_errs, nums, txts = _patch_xlsx_file(fpath, rel, base_xlsx.get(rel))
       findings.extend(f_errs)
       doc_records.append((rel, nums, txts))
       with contextlib.suppress(OSError):

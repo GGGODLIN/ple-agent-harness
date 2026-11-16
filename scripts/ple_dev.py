@@ -358,7 +358,17 @@ def _load_run_summary(run_dir: Path) -> dict[str, Any]:
     default_bk = "unverified_judge" if not judge_model else "error"
     tasks_map.setdefault(cid, {"score": None, "cost": Decimal("0"), "verified": False, "ver_status": default_vs, "bucket": default_bk})
   label = f"{submission} ({_clean_text(run_dir.name)})" if submission != _clean_text(run_dir.name) else submission
-  return {"path": run_dir, "label": label, "model": run_model, "tasks": tasks_map, "executed_count": len(raw_tasks), "toks": tok_sums, "tot_cost": tot_cost}
+  return {
+    "path": run_dir,
+    "label": label,
+    "model": run_model,
+    "tasks": tasks_map,
+    "executed_count": len(raw_tasks),
+    "toks": tok_sums,
+    "tot_cost": tot_cost,
+    "no_export": bool(raw_res.get("no_export")),
+    "complete": raw_res.get("complete") is True,
+  }
 
 
 def _write_csv_and_md(out_dir: Path, stem: str, title: str, headers: list[str], csv_rows: list[list[str]], md_rows: list[list[str]]) -> None:
@@ -409,6 +419,10 @@ def cmd_export_writeup(args: argparse.Namespace) -> int:
   except (OSError, ValueError, TypeError, AttributeError, InvalidOperation) as exc:
     return _err(_clean_text(str(exc)))
 
+  checked_summaries = [*summaries, *([base_sum] if base_dir and all(s["path"] != base_dir for s in summaries) else [])]
+  if tier == "STAGE1_FINAL_EXPORT" and any(s["no_export"] or not s["complete"] for s in checked_summaries):
+    return _err("STAGE1_FINAL_EXPORT requires complete exported runs (no_export=False and complete=True).")
+
   out_dir = Path(args.out_dir).resolve()
   f1_h = ["config_label", "model", "execution_tier", "measured_tasks", "unverified_tasks", "measured_mean_score", "mean_stage2_cost_usd", "total_uncached_input_tokens", "total_cache_write_tokens", "total_cache_read_tokens", "total_output_tokens"]
   f1_csv, f1_md = [], []
@@ -422,17 +436,28 @@ def cmd_export_writeup(args: argparse.Namespace) -> int:
     f1_md.append([s["label"], s["model"], tier, str(len(ver)), str(unver), m_sc or "N/A", *tail])
   _write_csv_and_md(out_dir, "figure1_pareto", f"Figure 1 - Score vs January-2027 Stage-2 USD Cost [{tier}]", f1_h, f1_csv, f1_md)
 
+  has_baseline = base_dir is not None or len(summaries) > 1
   cand_list = ([s for s in summaries if s["path"] != base_dir] or [summaries[-1]]) if base_dir else (summaries[1:] if len(summaries) > 1 else [summaries[0]])
   f2_h = ["task_id", "execution_tier", "baseline_score", "candidate_score", "score_delta", "baseline_cost_usd", "candidate_cost_usd", "cost_delta_usd", "verification_status"]
   f2_csv, f2_md = [], []
   for cand in cand_list:
-    for tid in sorted(set(base_sum["tasks"].keys()) | set(cand["tasks"].keys())):
+    task_ids = sorted(set(base_sum["tasks"].keys()) | set(cand["tasks"].keys())) if has_baseline else sorted(cand["tasks"].keys())
+    for tid in task_ids:
       rid = tid if len(cand_list) == 1 else f"{cand['label']}:{tid}"
-      bt, ct = base_sum["tasks"].get(tid), cand["tasks"].get(tid)
-      bv, cv = bool(bt and bt["verified"] and bt["score"] is not None), bool(ct and ct["verified"] and ct["score"] is not None)
-      bs, cs = (f"{bt['score']:.6f}" if bv and bt else ""), (f"{ct['score']:.6f}" if cv and ct else "")
+      ct = cand["tasks"].get(tid)
+      cv = bool(ct and ct["verified"] and ct["score"] is not None)
+      cs = f"{ct['score']:.6f}" if cv and ct else ""
+      cc = ct["cost"] if ct else Decimal("0")
+      if not has_baseline:
+        vs = "UNVERIFIED_MISSING_JUDGE" if (ct and ct["ver_status"] == "UNVERIFIED_MISSING_JUDGE") else "UNVERIFIED"
+        f2_csv.append([rid, tier, "", cs, "", "", f"{cc:.6f}", "", vs])
+        f2_md.append([rid, tier, "N/A", cs or "N/A", "N/A", "N/A", f"{cc:.6f}", "N/A", vs])
+        continue
+      bt = base_sum["tasks"].get(tid)
+      bv = bool(bt and bt["verified"] and bt["score"] is not None)
+      bs = f"{bt['score']:.6f}" if bv and bt else ""
       ds = f"{ct['score'] - bt['score']:.6f}" if (bv and cv and bt and ct) else ""
-      bc, cc = (bt["cost"] if bt else Decimal("0")), (ct["cost"] if ct else Decimal("0"))
+      bc = bt["cost"] if bt else Decimal("0")
       vs = "VERIFIED" if (bv and cv) else ("UNVERIFIED_MISSING_JUDGE" if ((bt and bt["ver_status"] == "UNVERIFIED_MISSING_JUDGE") or (ct and ct["ver_status"] == "UNVERIFIED_MISSING_JUDGE")) else "UNVERIFIED")
       tail = [f"{bc:.6f}", f"{cc:.6f}", f"{cc - bc:.6f}", vs]
       f2_csv.append([rid, tier, bs, cs, ds, *tail])
@@ -446,14 +471,11 @@ def cmd_export_writeup(args: argparse.Namespace) -> int:
 
 
 def cmd_lock_submission(args: argparse.Namespace) -> int:
+  if args.tier not in ALLOWED_TIERS:
+    return _err("Invalid --tier badge.")
   if not math.isfinite(args.mean_score):
     return _err("Invalid --mean-score.")
-  try:
-    score_dec = Decimal(str(args.mean_score))
-  except InvalidOperation:
-    return _err("Invalid --mean-score decimal.")
-  if not score_dec.is_finite():
-    return _err("Invalid --mean-score decimal.")
+  score_dec = Decimal(str(args.mean_score))
   if score_dec < DEV_SCORE_FLOOR:
     return _err(f"Rejected: mean_score {score_dec} is below {DEV_SCORE_FLOOR}.", 1)
   ledger_path = Path(args.ledger).resolve()
@@ -469,6 +491,8 @@ def cmd_lock_submission(args: argparse.Namespace) -> int:
       for x in raw_locks:
         if isinstance(x.get("mean_score"), bool) or not Decimal(str(x.get("mean_score", 0.0))).is_finite():
           return _err("Non-finite mean_score in submission ledger.")
+        if "execution_tier" in x and str(x.get("execution_tier") or "") not in ALLOWED_TIERS:
+          return _err("Invalid execution_tier in submission ledger.")
       existing = list(raw_locks)
     except (OSError, ValueError, TypeError, AttributeError, InvalidOperation) as exc:
       return _err(_clean_text(str(exc)))
@@ -479,6 +503,7 @@ def cmd_lock_submission(args: argparse.Namespace) -> int:
       "lock_index": i + 1,
       "git_rev": _clean_text(x.get("git_rev", "")),
       "model_api": _clean_text(x.get("model_api", "")),
+      "execution_tier": _clean_text(x.get("execution_tier") or "STAGE1_FINAL_EXPORT"),
       "mean_score": float(x.get("mean_score", 0.0)),
       "notes": _clean_text(x.get("notes", "")),
     }
@@ -488,6 +513,7 @@ def cmd_lock_submission(args: argparse.Namespace) -> int:
     "lock_index": len(locks) + 1,
     "git_rev": _clean_text(args.git_rev),
     "model_api": _clean_text(args.model_api),
+    "execution_tier": args.tier,
     "mean_score": float(score_dec),
     "notes": _clean_text(args.notes),
   })
@@ -501,7 +527,7 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
   if not script.is_file():
     return _err("pre-submit-hygiene.py not found.")
   res = subprocess.run([sys.executable, str(script), "--repo", str(repo_path)], check=False)
-  if res.returncode != 0 or not args.ple_root or args.skip_kit:
+  if res.returncode != 0 or not args.ple_root:
     return int(res.returncode)
   ple_root = Path(args.ple_root).resolve()
   if (repo_path / "artifacts").exists():
@@ -521,8 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
   specs = (
     ("run", cmd_run, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--out", {"required": True}), ("--tasks", {}), ("--env-file", {}), ("--model-api", {}), ("--eval-cmd", {"default": "uv run python eval/run.py"}), ("--tier", {"default": "LIVE_DOCKER_EVAL"}))),
     ("export-writeup", cmd_export_writeup, (("--runs", {"nargs": "+", "required": True}), ("--baseline-run", {}), ("--out-dir", {"required": True}), ("--tier", {}))),
-    ("lock-submission", cmd_lock_submission, (("--ledger", {"required": True}), ("--git-rev", {"required": True}), ("--model-api", {"required": True}), ("--mean-score", {"type": float, "required": True}), ("--notes", {"default": ""}))),
-    ("hygiene", cmd_hygiene, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--env-file", {}), ("--skip-kit", {"action": "store_true"}), ("--hygiene-script", {}))),
+    ("lock-submission", cmd_lock_submission, (("--ledger", {"required": True}), ("--git-rev", {"required": True}), ("--model-api", {"required": True}), ("--mean-score", {"type": float, "required": True}), ("--tier", {"default": "STAGE1_FINAL_EXPORT"}), ("--notes", {"default": ""}))),
+    ("hygiene", cmd_hygiene, (("--repo", {"default": str(REPO_ROOT)}), ("--ple-root", {}), ("--env-file", {}), ("--hygiene-script", {}))),
   )
   for name, fn, flags in specs:
     sp = sub.add_parser(name)

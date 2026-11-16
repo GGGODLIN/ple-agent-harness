@@ -101,7 +101,12 @@ def evaluate_seam2_p4_oracle(
       return False
     if expected_lock_count is not None and len(locks) != expected_lock_count:
       return False
-    if any(not isinstance(item, dict) or float(item.get("mean_score", 0.0)) < 0.138 for item in locks):
+    if any(
+        not isinstance(item, dict)
+        or float(item.get("mean_score", 0.0)) < 0.138
+        or item.get("execution_tier") not in {"STAGE1_FINAL_EXPORT", "LIVE_DOCKER_EVAL", "SYNTHETIC_PROTOCOL_TEST"}
+        for item in locks
+    ):
       return False
   return True
 
@@ -212,6 +217,14 @@ def test_export_writeup_figures_badges_and_unverified_rubric_handling(tmp_path: 
   _write_rollup(cand_dir / "attempt1/t3/agent.txt", {"status": "done", "model": "google-cloud/glm-5.2", "uncached_input_tokens": 500, "cache_write_tokens": 0, "cache_read_tokens": 0, "output_tokens": 100, "cost_usd": 0.00114, "summary": "memo", "error": ""})
 
   assert _run_cli(["export-writeup", "--runs", str(cand_dir), "--out-dir", str(tmp_path / "bad_exp"), "--tier", "BOGUS_TIER"]).returncode != 0
+  assert _run_cli(["export-writeup", "--runs", str(cand_dir), "--out-dir", str(tmp_path / "bad_stage1"), "--tier", "STAGE1_FINAL_EXPORT"]).returncode != 0
+
+  single_dir = tmp_path / "single_out"
+  assert _run_cli(["export-writeup", "--runs", str(cand_dir), "--out-dir", str(single_dir), "--tier", "LIVE_DOCKER_EVAL"]).returncode == 0
+  single_f2 = {r["task_id"]: r for r in csv.DictReader(io.StringIO((single_dir / "figure2_ablation.csv").read_text(encoding="utf-8")))}
+  assert single_f2["mep-routing"]["baseline_score"] == "" and single_f2["mep-routing"]["score_delta"] == ""
+  assert single_f2["mep-routing"]["cost_delta_usd"] == "" and single_f2["mep-routing"]["verification_status"] == "UNVERIFIED"
+  assert single_f2["rubric-memo-task"]["verification_status"] == "UNVERIFIED_MISSING_JUDGE"
 
   exp_dir = tmp_path / "writeup_out"
   cmd = ["export-writeup", "--runs", str(base_dir), str(cand_dir), "--baseline-run", str(base_dir), "--out-dir", str(exp_dir), "--tier", "SYNTHETIC_PROTOCOL_TEST"]
@@ -250,10 +263,11 @@ def test_lock_submission_guards_floor_and_lifetime_cap_and_hygiene_delegation(tm
   ledger_path = tmp_path / "submission_locks.json"
 
   assert _run_cli(["lock-submission", "--ledger", str(ledger_path), "--git-rev", "111", "--model-api", "glm-5.2", "--mean-score", "0.1379"]).returncode != 0
+  assert _run_cli(["lock-submission", "--ledger", str(ledger_path), "--git-rev", "111", "--model-api", "glm-5.2", "--mean-score", "0.250", "--tier", "BAD_TIER"]).returncode != 0
   assert not ledger_path.exists()
 
   for idx, sc in enumerate(["0.138", "0.210", "0.350", "0.480", "0.620"], start=1):
-    ok = _run_cli(["lock-submission", "--ledger", str(ledger_path), "--git-rev", f"rev{idx}", "--model-api", "google-cloud/glm-5.2", "--mean-score", sc, "--notes", f"lock {idx} {fake_secret}"])
+    ok = _run_cli(["lock-submission", "--ledger", str(ledger_path), "--git-rev", f"rev{idx}", "--model-api", "google-cloud/glm-5.2", "--mean-score", sc, "--tier", "LIVE_DOCKER_EVAL", "--notes", f"lock {idx} {fake_secret}"])
     assert ok.returncode == 0, "lock-submission failed unexpectedly"
     if idx == 2:
       snap_two = ledger_path.read_bytes()
@@ -265,6 +279,7 @@ def test_lock_submission_guards_floor_and_lifetime_cap_and_hygiene_delegation(tm
   assert ledger_path.read_bytes() == snap_five
   ledger_data = json.loads(ledger_path.read_text(encoding="utf-8"))
   assert len(ledger_data["locks"]) == 5 and _has_forbidden_key(ledger_data) is False
+  assert all(item.get("execution_tier") == "LIVE_DOCKER_EVAL" for item in ledger_data["locks"])
   leaked = _has_secret(ledger_path.read_text(encoding="utf-8"), fake_secret)
   assert not leaked, "synthetic secret leaked into submission ledger"
 
@@ -272,7 +287,7 @@ def test_lock_submission_guards_floor_and_lifetime_cap_and_hygiene_delegation(tm
   _init_temp_git_repo(clean_repo)
   stub_hygiene = tmp_path / "stub_hygiene.py"
   stub_hygiene.write_text("import sys; sys.exit(0)\n", encoding="utf-8")
-  assert _run_cli(["hygiene", "--repo", str(clean_repo), "--hygiene-script", str(stub_hygiene), "--skip-kit"]).returncode == 0
+  assert _run_cli(["hygiene", "--repo", str(clean_repo), "--hygiene-script", str(stub_hygiene)]).returncode == 0
 
   (clean_repo / "artifacts").mkdir()
   (clean_repo / "artifacts" / "marker.txt").write_text("ok\n", encoding="utf-8")
@@ -444,7 +459,7 @@ def test_seam2_p4_oracle_calibration() -> None:
       "figure3_failures.csv": b"run_label,execution_tier,bucket,count,share\ncfg,LIVE_DOCKER_EVAL,done_pass,1,1.0\n",
       "figure3_failures.md": b"# Figure 3 [LIVE_DOCKER_EVAL]\n",
   }
-  good_ledger = {"locks": [{"lock_index": 1, "git_rev": "abc", "model_api": "glm-5.2", "mean_score": 0.25, "notes": "clean"}]}
+  good_ledger = {"locks": [{"lock_index": 1, "git_rev": "abc", "model_api": "glm-5.2", "execution_tier": "LIVE_DOCKER_EVAL", "mean_score": 0.25, "notes": "clean"}]}
   cal_good = evaluate_seam2_p4_oracle(export_snap_1=good_snap, export_snap_2=dict(good_snap), cli_outputs=["ok"], json_payloads=[{"tier": "LIVE_DOCKER_EVAL"}], ledger_data=good_ledger, expected_lock_count=1, fake_secrets=(fake_secret,))
   assert cal_good is True, "good calibration baseline must pass"
 

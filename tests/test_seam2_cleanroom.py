@@ -102,7 +102,7 @@ def test_cleanroom_clone_passes_pre_submit_hygiene(tmp_path: Path) -> None:
 
   for check_root in (target, REPO_ROOT):
     for p in check_root.rglob("*"):
-      if any(part in {".git", ".scratch", ".pytest_cache", "__pycache__", ".venv"} for part in p.parts):
+      if any(part in {".git", ".scratch", ".pytest_cache", ".hypothesis", "__pycache__", ".venv"} for part in p.parts):
         continue
       assert not p.is_symlink(), f"unexpected symlink: {p.relative_to(check_root)}"
       if p.is_file():
@@ -118,6 +118,13 @@ def test_cleanroom_clone_passes_pre_submit_hygiene(tmp_path: Path) -> None:
       low = (check_root / rel).read_text(encoding="utf-8").lower()
       has_forbidden = any(term in low for term in FORBIDDEN_TERMS)
       assert not has_forbidden, f"custom harness file {rel} contains forbidden term"
+
+  clean_env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL") if k in os.environ}
+  clone_pytest = subprocess.run(
+      [sys.executable, "-m", "pytest", "tests/test_seam2_cli.py", "-k", "lock_submission", "-q"],
+      cwd=str(target), text=True, capture_output=True, timeout=20, check=False, env=clean_env,
+  )
+  assert clone_pytest.returncode == 0, f"cleanroom clone pytest failed:\n{clone_pytest.stdout}\n{clone_pytest.stderr}"
 
   for test_py in sorted((REPO_ROOT / "tests").glob("*.py")):
     t_txt = test_py.read_text(encoding="utf-8")

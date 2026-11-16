@@ -72,10 +72,24 @@ def _sse_reply(*, text: str = "", calls: list[tuple[str, str, dict[str, Any]]] |
   return ("".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n").encode("utf-8")
 
 
-async def _run_ws_session(harness_mod: Any, taskbridge_mod: Any, workdir: Path, *, mcp_servers: list[dict[str, Any]] | None = None, fail_write_nums: set[int] | None = None, cancel_on_cmd_num: int | None = None, cancel_trigger: asyncio.Event | None = None) -> tuple[list[dict[str, Any]], int | None]:
+async def _run_ws_session(
+  harness_mod: Any,
+  taskbridge_mod: Any,
+  workdir: Path,
+  *,
+  instruction: str = "Solve task",
+  limits: dict[str, Any] | None = None,
+  mcp_servers: list[dict[str, Any]] | None = None,
+  exec_path: str | None = None,
+  exec_override: Any = None,
+  fail_write_nums: set[int] | None = None,
+  cancel_on_cmd_num: int | None = None,
+  cancel_trigger: asyncio.Event | None = None,
+) -> tuple[list[dict[str, Any]], int | None]:
   ws_port, frames, cancelled_at = _free_tcp_port(), [], None
   cmd_count = write_count = exec_count = 0
   fail_writes = fail_write_nums or set()
+  workdir.mkdir(parents=True, exist_ok=True)
   with contextlib.redirect_stderr(io.StringIO()):
     server_task = asyncio.create_task(taskbridge_mod.serve_forever(harness_mod.solve, port=ws_port))
     try:
@@ -88,7 +102,7 @@ async def _run_ws_session(harness_mod: Any, taskbridge_mod: Any, workdir: Path, 
           await asyncio.sleep(0.02)
       assert ws is not None
       async with ws:
-        await ws.send(json.dumps({"type": "task", "instruction": "Solve task", "workdir": str(workdir), "mcp_servers": mcp_servers or [], "limits": {"agent_timeout_sec": 60}}))
+        await ws.send(json.dumps({"type": "task", "instruction": instruction, "workdir": str(workdir), "mcp_servers": mcp_servers or [], "limits": limits or {"agent_timeout_sec": 60}}))
 
         async def _watch_trigger() -> None:
           nonlocal cancelled_at
@@ -101,7 +115,7 @@ async def _run_ws_session(harness_mod: Any, taskbridge_mod: Any, workdir: Path, 
         trig_task = asyncio.create_task(_watch_trigger())
         try:
           while True:
-            frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=4.0))
+            frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
             frames.append(frame)
             ftype = frame.get("type")
             if ftype in ("done", "error"):
@@ -116,7 +130,14 @@ async def _run_ws_session(harness_mod: Any, taskbridge_mod: Any, workdir: Path, 
                 continue
             if ftype == "exec":
               exec_count += 1
-              proc = subprocess.run(["bash", "-c", frame["command"]], cwd=str(workdir), env=_safe_subprocess_env({"PLEBENCH_EXEC_ID": f"ple-exec-{exec_count}"}), capture_output=True, timeout=4.0)
+              custom = exec_override(frame["command"], exec_count) if exec_override is not None else None
+              if custom is not None:
+                await ws.send(json.dumps({"type": "result", "id": frame["id"], **custom}))
+                continue
+              overrides = {"PLEBENCH_EXEC_ID": f"ple-exec-{exec_count}"}
+              if exec_path is not None:
+                overrides["PATH"] = exec_path
+              proc = subprocess.run(["bash", "-c", frame["command"]], cwd=str(workdir), env=_safe_subprocess_env(overrides), capture_output=True, timeout=5.0)
               raw_out = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
               await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "exit_code": proc.returncode, "output": raw_out[:100_000], "truncated": len(raw_out) > 100_000, "timed_out": False}))
             elif ftype == "read_file":
@@ -135,7 +156,21 @@ async def _run_ws_session(harness_mod: Any, taskbridge_mod: Any, workdir: Path, 
                   fh.write(chunk)
                 await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "size": target.stat().st_size}))
             elif ftype == "http":
-              await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": False, "error": "unexpected http"}))
+              if mcp_servers:
+                rpc = json.loads(base64.b64decode(frame["body_b64"]).decode("utf-8"))
+                m, rid = rpc.get("method"), rpc.get("id")
+                if m == "initialize":
+                  r_obj: dict[str, Any] | None = {"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "lab", "version": "1.0"}}}
+                elif m == "notifications/initialized":
+                  r_obj = None
+                elif m == "tools/list":
+                  r_obj = {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "status", "description": "Lab status", "inputSchema": {"type": "object", "properties": {}}}]}}
+                else:
+                  r_obj = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "lab-ready"}], "isError": False}}
+                rb = json.dumps(r_obj).encode("utf-8") if r_obj is not None else b""
+                await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "status": 200 if r_obj is not None else 202, "headers": {"content-type": "application/json"}, "body_b64": base64.b64encode(rb).decode("ascii"), "truncated": False}))
+              else:
+                await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": False, "error": "unexpected http"}))
         finally:
           trig_task.cancel()
           with contextlib.suppress(asyncio.CancelledError):
@@ -347,54 +382,47 @@ def test_cross_provider_stage2_pricing_and_redacted_rollup(tmp_path: Path) -> No
 
 
 def test_sync_final_message_preserves_prose_and_excludes_scratch_paths(tmp_path: Path) -> None:
-  taskbridge, harness = _load_repo_module("taskbridge"), _load_repo_module("harness")
-  assert not hasattr(harness, "client") and not hasattr(harness, "EFFORT") and not hasattr(harness, "COMPACT_AT_TOKENS")
-
   async def _scenario() -> None:
+    work = tmp_path / "work"
+    ext_dir = tmp_path / "filesystem_ext"
     in_turn5, release_turn5 = asyncio.Event(), asyncio.Event()
     prose_summary = "Computed optimal beam section S200 with safety factor 1.85."
     scratch_facts = f"/tmp/.ple_work_scratch_test_{os.getpid()}/facts.json"
+    scratch_tmp = f"/tmp/ple_tmp_script_{os.getpid()}.py"
 
     async def _h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
       if n == 1:
-        return (200, "text/event-stream", _sse_reply(calls=[("w1", "write_file", {"path": "beam.txt", "content": "S200 sf=1.8"}), ("w2", "write_file", {"path": scratch_facts, "content": "{\"sf\": 1.85}"})], finish_reason="tool_calls"))
+        return (200, "text/event-stream", _sse_reply(calls=[("w1", "write_file", {"path": "beam.txt", "content": "S200 sf=1.8"}), ("w2", "write_file", {"path": scratch_facts, "content": "{\"sf\": 1.85}"}), ("w3", "write_file", {"path": scratch_tmp, "content": "x = 1\n"}), ("w4", "write_file", {"path": str(ext_dir / "ext.md"), "content": "ok\n"})], finish_reason="tool_calls"))
       if n == 2:
         return (200, "text/event-stream", _sse_reply(text=prose_summary, finish_reason="stop"))
       if n == 3:
         return (200, "text/event-stream", _sse_reply(text="VERIFIER_FAIL: 1. Add exact 1.85 digit in beam.txt", finish_reason="stop"))
       if n == 4:
-        return (200, "text/event-stream", _sse_reply(calls=[("w3", "write_file", {"path": "beam.txt", "content": "S200 sf=1.85\n"})], finish_reason="tool_calls"))
+        return (200, "text/event-stream", _sse_reply(calls=[("w5", "write_file", {"path": "beam.txt", "content": "S200 sf=1.85\n"})], finish_reason="tool_calls"))
       in_turn5.set()
       with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(release_turn5.wait(), timeout=1.5)
       return (200, "text/event-stream", _sse_reply(text="Partial incomplete fragment", finish_reason="stop"))
 
     try:
-      frames, _, _ = await _run_stub(_h, tmp_path, env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "1"}, cancel_trigger=in_turn5)
+      frames, _, _ = await _run_stub(_h, work, env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "1"}, cancel_trigger=in_turn5)
       release_turn5.set()
       final_msg = str(frames[-1].get("final_message", ""))
       assert prose_summary in final_msg
-      assert f"{tmp_path / 'beam.txt'} (13 bytes)" in final_msg
+      assert f"{work / 'beam.txt'} (13 bytes)" in final_msg
+      assert f"{ext_dir / 'ext.md'} (3 bytes)" in final_msg
       assert ".ple_work_" not in final_msg
+      assert scratch_tmp not in final_msg
       assert "Partial incomplete fragment" not in final_msg
     finally:
       shutil.rmtree(Path(scratch_facts).parent, ignore_errors=True)
-
-    dummy_session = taskbridge.Session(None, {"type": "task", "instruction": "Test", "workdir": "/workspace"})
-    ag = harness.Agent(dummy_session)
-    try:
-      assert ag._is_deliverable_target("/workspace/out.md") is True
-      assert ag._is_deliverable_target("/filesystem/out.md") is True
-      assert ag._is_deliverable_target("/tmp/scratch_script.py") is False
-      assert ag._is_deliverable_target(f"/tmp/.ple_work_{ag.session_tag}/facts.json") is False
-    finally:
-      await ag.close()
+      with contextlib.suppress(OSError):
+        Path(scratch_tmp).unlink()
 
   asyncio.run(asyncio.wait_for(_scenario(), timeout=6.0))
 
 
-def test_redact_secrets_patterns_url_userinfo_and_hybrid_openai_usage() -> None:
-  harness = _load_repo_module("harness")
+def test_redact_secrets_patterns_url_userinfo_and_hybrid_openai_usage(tmp_path: Path) -> None:
   judge_key = "ple-judge-" + "secret-token-7788"
   url_user = "ple_url_user_99"
   url_pass_raw = "ple@pass/secret#42"
@@ -408,29 +436,46 @@ def test_redact_secrets_patterns_url_userinfo_and_hybrid_openai_usage() -> None:
   tok_bearer = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ple+synth/tok=1:~"
   tok_q = "qparam_synth_secret_5566"
   pem_hdr = "-----BEGIN " + "RSA PRIVATE KEY-----"
+  all_secrets = (judge_key, url_user, url_pass_raw, tok_q, tok_bearer, tok_ai, tok_hf, tok_ghp, tok_ghpat, tok_aws, tok_slack, pem_hdr)
 
   sample = (
-    f"judge={judge_key} user={url_user} pass={url_pass_raw} "
+    f"Summary: judge={judge_key} user={url_user} pass={url_pass_raw} "
     f"url=https://api.example.com/v1?api_key={tok_q}&other=1 "
     f"auth=Bearer {tok_bearer} g={tok_ai} h={tok_hf} gh1={tok_ghp} "
     f"gh2={tok_ghpat} aws={tok_aws} sl={tok_slack} pem={pem_hdr}"
   )
-  assert all(_contains_token(sample, s) for s in (judge_key, url_user, url_pass_raw, tok_q, tok_bearer, tok_ai, tok_hf, tok_ghp, tok_ghpat, tok_aws, tok_slack, pem_hdr))
-
-  with _env_scope(
-    JUDGE_API_KEY=judge_key,
-    ANTHROPIC_BASE_URL=f"https://{url_user}:{url_pass_enc}@proxy.example.com/v1",
-  ):
-    scrubbed = harness.redact_secrets(sample)
-
-  leaked = any(
-    _contains_token(scrubbed, s)
-    for s in (judge_key, url_user, url_pass_raw, tok_q, tok_bearer, tok_ai, tok_hf, tok_ghp, tok_ghpat, tok_aws, tok_slack, pem_hdr)
-  )
-  assert not leaked, "redact_secrets left sensitive token unredacted"
-
+  assert all(_contains_token(sample, s) for s in all_secrets)
   hybrid_u = {"prompt_tokens": 1000, "completion_tokens": 200, "cache_read_input_tokens": 600, "cache_creation_input_tokens": 150}
-  assert harness.normalize_usage(hybrid_u) == (250, 150, 600, 200)
+
+  async def _scenario() -> None:
+    async def _h(_req: dict[str, Any], _n: int) -> tuple[int, str, bytes]:
+      return (200, "text/event-stream", _sse_reply(text=sample, finish_reason="stop", usage=hybrid_u))
+
+    frames, _, _ = await _run_stub(
+      _h,
+      tmp_path / "redact_ws",
+      env={
+        "MODEL_API_KEY": "stub-k",
+        "MODEL_NAME": "google-cloud/glm-5.2",
+        "PLE_ENABLE_VERIFIER": "0",
+        "JUDGE_API_KEY": judge_key,
+        "ANTHROPIC_BASE_URL": f"https://{url_user}:{url_pass_enc}@proxy.example.com/v1",
+      },
+    )
+    final_msg = str(frames[-1].get("final_message", ""))
+    rollup_line = str(frames[-2].get("text", ""))
+    assert rollup_line.startswith("[PLE_ROLLUP] ")
+    rollup = json.loads(rollup_line[len("[PLE_ROLLUP] ") :])
+    leaked = any(_contains_token(final_msg, s) or _contains_token(rollup_line, s) for s in all_secrets)
+    assert not leaked, "WebSocket final_message or [PLE_ROLLUP] left sensitive token unredacted"
+    assert (
+      rollup["uncached_input_tokens"],
+      rollup["cache_write_tokens"],
+      rollup["cache_read_tokens"],
+      rollup["output_tokens"],
+    ) == (250, 150, 600, 200)
+
+  asyncio.run(asyncio.wait_for(_scenario(), timeout=5.0))
 
 
 @settings(max_examples=15, deadline=None)

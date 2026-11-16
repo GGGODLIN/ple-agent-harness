@@ -56,7 +56,7 @@ _AUDIT_SCRIPT_B64 = base64.b64encode(
     Path(__file__).with_name("deliverable_audit.py").read_bytes()
 ).decode("ascii")
 
-MODEL = os.environ.get("MODEL_NAME", "")
+MAX_OPT_ROUNDS = 3
 MAX_EFFORT_MODELS = ("claude", "glm", "gpt-6", "deepseek-v4")
 OMIT_EFFORT_MODELS = ("gemma", "llama")
 SECRET_ENV_VARS = (
@@ -277,9 +277,6 @@ RESPONSES_MODELS = ("gpt-6",)
 RESPONSES_ONLY = re.compile(
     r"/v1/responses|not supported.{0,80} in /v1/chat/completions"
 )
-# Claude reuses a cached prompt prefix only where a request marks one
-# (marked()); other models cache on their own.
-CACHE_MARK = "claude" in MODEL.lower()
 TOOL_RESULT_CHARS = 30_000
 # MCP tools are offered as functions up to this many characters of JSON in all
 DIRECT_MCP_CHARS = 40_000
@@ -681,7 +678,7 @@ def drop_thinking(
 
 
 def marked(
-    messages: list[dict[str, Any]], cache_mark: bool | None = None
+    messages: list[dict[str, Any]], cache_mark: bool = False
 ) -> list[dict[str, Any]]:
   """Returns the messages a Chat Completions call sends.
 
@@ -692,12 +689,12 @@ def marked(
 
   Args:
     messages: The conversation so far.
-    cache_mark: Optional override indicating whether Claude cache markers apply.
+    cache_mark: Whether Claude cache markers apply.
 
   Returns:
     `messages` itself for other models, or the marked copy for Claude.
   """
-  if not (CACHE_MARK if cache_mark is None else cache_mark):
+  if not cache_mark:
     return messages
   out = list(messages)
   for i in {0, len(out) - 1}:
@@ -1031,7 +1028,7 @@ class Agent:
 
   def __init__(self, session: taskbridge.Session):
     self.session = session
-    self.model = os.environ.get("MODEL_NAME", MODEL)
+    self.model = os.environ.get("MODEL_NAME", "")
     self.cache_mark = "claude" in self.model.lower()
     self.compact_at_tokens = int(os.environ.get("COMPACT_AT_TOKENS", "150000"))
     self.client = _build_client()
@@ -1715,6 +1712,17 @@ class Agent:
     read_task = asyncio.create_task(read())
     cancel_task = asyncio.create_task(self.session.cancelled.wait())
     timeout = None if left is None else max(0.0, left - reserve)
+
+    async def _abort_read_and_preserve_partial(*, cancel_read: bool) -> None:
+      if cancel_read:
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+          await read_task
+      if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
+        partial = redact_secrets(visible(head + reply.text))
+        if partial:
+          self.session.final_message = partial
+
     try:
       done, _ = await asyncio.wait(
           {read_task, cancel_task},
@@ -1722,29 +1730,14 @@ class Agent:
           return_when=asyncio.FIRST_COMPLETED,
       )
       if cancel_task in done or self.session.cancelled.is_set():
-        read_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-          await read_task
-        if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
-          partial = redact_secrets(visible(head + reply.text))
-          if partial:
-            self.session.final_message = partial
+        await _abort_read_and_preserve_partial(cancel_read=True)
         raise taskbridge.Cancelled("cancelled")
       if not done:
-        read_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-          await read_task
-        if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
-          partial = redact_secrets(visible(head + reply.text))
-          if partial:
-            self.session.final_message = partial
+        await _abort_read_and_preserve_partial(cancel_read=True)
         raise CutOff() from None
       await read_task
     except asyncio.CancelledError:
-      if not self._last_summary_prose and (head or (head is not None and not self.delivered)):
-        partial = redact_secrets(visible(head + reply.text))
-        if partial:
-          self.session.final_message = partial
+      await _abort_read_and_preserve_partial(cancel_read=False)
       raise
     except openai.APIError as exc:
       # the SDK raises an error sent inside a chat stream as an APIError
@@ -2075,7 +2068,6 @@ class Agent:
             f" finishing:\n{bullets}\nRepair the deliverables, re-verify"
             " consistency, and provide your updated final summary."
         )
-    max_opt = min(3, max(0, int(os.environ.get("PLE_MAX_OPT_ROUNDS", "3") or "3")))
     if self._has_self_checked_opt and "OPTIMIZATION_CONVERGED" in text:
       self._opt_converged = True
     if (
@@ -2084,11 +2076,11 @@ class Agent:
             self.session.instruction
         )
         and not self._opt_converged
-        and self.opt_rounds < max_opt
+        and self.opt_rounds < MAX_OPT_ROUNDS
     ):
       self.opt_rounds += 1
       return (
-          f"Optimization pass ({self.opt_rounds}/{max_opt}): Run a"
+          f"Optimization pass ({self.opt_rounds}/{MAX_OPT_ROUNDS}): Run a"
           " self-checked Python optimization script (include `assert` checks"
           " verifying both a nominal feasible design pass and a"
           " violated-constraint failure) using scipy or catalog search to"

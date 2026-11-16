@@ -53,6 +53,15 @@ uv run --directory <path-to-ple> python -m kit check --rebuild --cancel-test \
 ### 3. External-Worktree Paired Dev-Set Evaluation (`--no-export`)
 
 ```bash
+# Baseline run (official minimal/custom-openai sample submission inside <path-to-ple>)
+uv run --directory <path-to-ple> python eval/run.py \
+  <path-to-ple>/sample_submissions/custom-openai \
+  --no-export \
+  --env-file <path-to-env-file> \
+  --tasks <task-ids> \
+  --out <external-out-dir>/run_baseline
+
+# Candidate run (isolated detached git worktree leaving main checkout untouched)
 python3 scripts/ple_dev.py run \
   --repo <path-to-repo> \
   --ple-root <path-to-ple> \
@@ -66,6 +75,7 @@ python3 scripts/ple_dev.py run \
 ### 4. Export Writeup Figures 1–3 & Lock Candidate Submission
 
 ```bash
+# Paired baseline-vs-candidate export (or pass a single run directory to --runs for single-run tables)
 python3 scripts/ple_dev.py export-writeup \
   --runs <external-out-dir>/run_baseline <external-out-dir>/run_candidate \
   --baseline-run <external-out-dir>/run_baseline \
@@ -77,6 +87,7 @@ python3 scripts/ple_dev.py lock-submission \
   --git-rev <commit-sha> \
   --model-api google-cloud/glm-5.2 \
   --mean-score <dev-mean-score> \
+  --tier STAGE1_FINAL_EXPORT \
   --notes "Stage-1 verified candidate"
 
 python3 scripts/ple_dev.py hygiene --repo <path-to-repo> --ple-root <path-to-ple> --env-file <path-to-env-file>

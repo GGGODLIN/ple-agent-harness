@@ -42,8 +42,8 @@ TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
   sys.path.insert(0, str(TESTS_DIR))
 
-from test_seam1_core import CONTAINER_CMD_TYPES, _env_scope, _sse_reply, evaluate_p2_oracle  # noqa: E402
-from test_seam1_gate import REPO_ROOT, StubOpenAIServer, _free_tcp_port, _load_repo_module, _safe_subprocess_env, _sse_text_reply, _sse_tool_call_reply  # noqa: E402
+from test_seam1_core import CONTAINER_CMD_TYPES, _run_stub, _sse_reply, evaluate_p2_oracle  # noqa: E402
+from test_seam1_gate import REPO_ROOT, _sse_text_reply, _sse_tool_call_reply  # noqa: E402
 
 COPYLEFT_RE = re.compile(r"\b(?:pymupdf|fitz|formulas)\b", re.IGNORECASE)
 
@@ -72,76 +72,32 @@ def _path_without_soffice(tmp_dir: Path) -> str:
 
 
 async def _run_audit_ws(
-  stub_fn: Any, workdir: Path, *, instruction: str, env: dict[str, str],
-  mcp_servers: list[dict[str, Any]] | None = None, exec_path: str | None = None,
+  stub_fn: Any,
+  workdir: Path,
+  *,
+  instruction: str,
+  env: dict[str, str],
+  mcp_servers: list[dict[str, Any]] | None = None,
+  exec_path: str | None = None,
+  limits: dict[str, Any] | None = None,
+  exec_override: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-  taskbridge, harness = _load_repo_module("taskbridge"), _load_repo_module("harness")
-  ws_port, frames, exec_idx = _free_tcp_port(), [], 0
-  workdir.mkdir(parents=True, exist_ok=True)
-  async with StubOpenAIServer(stub_fn) as stub:
-    with _env_scope(MODEL_BASE_URL=stub.base_url, **env), contextlib.redirect_stderr(io.StringIO()):
-      server_task = asyncio.create_task(taskbridge.serve_forever(harness.solve, port=ws_port))
-      try:
-        ws = None
-        for _ in range(40):
-          try:
-            ws = await websockets.connect(f"ws://127.0.0.1:{ws_port}")
-            break
-          except OSError:
-            await asyncio.sleep(0.02)
-        assert ws is not None
-        async with ws:
-          await ws.send(json.dumps({"type": "task", "instruction": instruction, "workdir": str(workdir), "mcp_servers": mcp_servers or [], "limits": {"agent_timeout_sec": 60}}))
-          while True:
-            frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
-            frames.append(frame)
-            ftype = frame.get("type")
-            if ftype in ("done", "error"):
-              break
-            if ftype == "exec":
-              exec_idx += 1
-              overrides = {"PLEBENCH_EXEC_ID": f"ple-exec-{exec_idx}"}
-              if "PLE_DISABLE_SOFFICE" in env:
-                overrides["PLE_DISABLE_SOFFICE"] = env["PLE_DISABLE_SOFFICE"]
-              if exec_path is not None:
-                overrides["PATH"] = exec_path
-              c_env = _safe_subprocess_env(overrides)
-              proc = subprocess.run(["bash", "-c", frame["command"]], cwd=str(workdir), env=c_env, capture_output=True, timeout=5.0)
-              out = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
-              await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "exit_code": proc.returncode, "output": out[:100_000], "truncated": len(out) > 100_000, "timed_out": False}))
-            elif ftype == "read_file":
-              tgt = Path(frame["path"])
-              res = {"type": "result", "id": frame["id"], "ok": False, "error": "No such file"} if not tgt.is_file() else {"type": "result", "id": frame["id"], "ok": True, "content_b64": base64.b64encode(d := tgt.read_bytes()).decode("ascii"), "size": len(d), "truncated": False}
-              await ws.send(json.dumps(res))
-            elif ftype == "write_file":
-              tgt, chunk = Path(frame["path"]), base64.b64decode(frame["content_b64"])
-              tgt.parent.mkdir(parents=True, exist_ok=True)
-              with tgt.open("ab" if frame.get("append") else "wb") as fh:
-                fh.write(chunk)
-              await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "size": tgt.stat().st_size}))
-            elif ftype == "http":
-              rpc = json.loads(base64.b64decode(frame["body_b64"]).decode("utf-8"))
-              m, rid = rpc.get("method"), rpc.get("id")
-              if m == "initialize":
-                r_obj: dict[str, Any] | None = {"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "lab", "version": "1.0"}}}
-              elif m == "notifications/initialized":
-                r_obj = None
-              elif m == "tools/list":
-                r_obj = {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "status", "description": "Lab status", "inputSchema": {"type": "object", "properties": {}}}]}}
-              else:
-                r_obj = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "lab-ready"}], "isError": False}}
-              rb = json.dumps(r_obj).encode("utf-8") if r_obj is not None else b""
-              await ws.send(json.dumps({"type": "result", "id": frame["id"], "ok": True, "status": 200 if r_obj is not None else 202, "headers": {"content-type": "application/json"}, "body_b64": base64.b64encode(rb).decode("ascii"), "truncated": False}))
-      finally:
-        server_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-          await server_task
-  for blob in [json.dumps(frames), json.dumps(stub.requests)]:
+  frames, _, reqs = await _run_stub(
+    stub_fn,
+    workdir,
+    env=env,
+    instruction=instruction,
+    mcp_servers=mcp_servers,
+    exec_path=exec_path,
+    limits=limits,
+    exec_override=exec_override,
+  )
+  for blob in (json.dumps(frames), json.dumps(reqs)):
     for m in re.findall(r"/tmp/\.ple_work_[A-Za-z0-9_]+", blob):
       shutil.rmtree(m, ignore_errors=True)
   rline = str(frames[-2].get("text", ""))
   rollup = json.loads(rline[len("[PLE_ROLLUP] ") :]) if rline.startswith("[PLE_ROLLUP] ") else {}
-  return frames, stub.requests, rollup
+  return frames, reqs, rollup
 
 
 def evaluate_p3_oracle(
@@ -234,7 +190,7 @@ def test_ooxml_audit_without_soffice_and_facts_json_crosscheck(tmp_path: Path) -
         return (200, "text/event-stream", _sse_reply(calls=[("c3", "bash", {"command": f"python3 -c {shlex.quote(py_fix)}"}), ("c4", "write_file", {"path": "summary.md", "content": "Report\ndesign_load: 196.0 kN\n"})], finish_reason="tool_calls"))
       return (200, "text/event-stream", _sse_text_reply("Final verified summary"))
 
-    frames, reqs, rollup = await _run_audit_ws(_h, tmp_path, instruction="Update model.xlsx and summary.md with consistent design_load.", env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_DISABLE_SOFFICE": "1", "PLE_ENABLE_VERIFIER": "0"}, exec_path=no_soffice_path)
+    frames, reqs, rollup = await _run_audit_ws(_h, tmp_path, instruction="Update model.xlsx and summary.md with consistent design_load.", env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"}, exec_path=no_soffice_path)
     assert len(reqs) == 4
     repair_prompt = reqs[2]["json"]["messages"][-1]["content"]
     assert "#DIV/0!" in repair_prompt and "design_load" in repair_prompt
@@ -335,16 +291,10 @@ def test_verifier_toggle_clean_context_readonly_and_unified_rollup(tmp_path: Pat
   asyncio.run(asyncio.wait_for(_scenario(), timeout=8.0))
 
 
-def test_untouched_xlsx_baseline_volatile_today_and_blank_cmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-  da = _load_repo_module("deliverable_audit")
-  monkeypatch.setattr(sys, "argv", ["deliverable_audit.py"])
-  assert da._cli() == 2
-  assert da.is_quantitative_optimization_task("Write a qualitative engineering memorandum assessing pipe corrosion.") is False
-  assert da.is_quantitative_optimization_task("Provide a qualitative assessment of heat exchanger fouling.") is False
-
+def test_untouched_xlsx_baseline_volatile_today_and_blank_cmp(tmp_path: Path) -> None:
   work = tmp_path / "work"
-  state = tmp_path / "state"
   work.mkdir()
+  no_soffice_path = _path_without_soffice(tmp_path)
 
   untouched_path = work / "untouched_ref.xlsx"
   wb_u = xlsxwriter.Workbook(str(untouched_path))
@@ -367,189 +317,177 @@ def test_untouched_xlsx_baseline_volatile_today_and_blank_cmp(tmp_path: Path, mo
   ws_c.write_formula("C4", '=IF(999<"a",IF("z"<TRUE,1,0),0)', None, 1)
   wb_e.close()
 
-  da.snapshot_workdir(work, state)
-  assert da.is_workdir_dirty(work, state) is False
-  idle_audit = da.audit_workdir(work, state)
-  assert idle_audit["outcome"] == "not_run"
-  assert untouched_path.read_bytes() == untouched_before
+  async def _scenario() -> None:
+    async def _qual_h(_req: dict[str, Any], _n: int) -> tuple[int, str, bytes]:
+      return (200, "text/event-stream", _sse_text_reply("Qualitative corrosion memorandum complete."))
 
-  wb_mod = openpyxl.load_workbook(edit_path)
-  wb_mod["Inputs"]["B1"] = 250.0
-  wb_mod.save(edit_path)
-  wb_mod.close()
+    _, _, qual_rollup = await _run_audit_ws(
+      _qual_h,
+      work,
+      instruction="Write a qualitative engineering memorandum assessing pipe corrosion.",
+      env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"},
+      exec_path=no_soffice_path,
+    )
+    assert qual_rollup["audit_outcome"] == "not_run" and qual_rollup["opt_rounds"] == 0
+    assert untouched_path.read_bytes() == untouched_before
 
-  assert da.is_workdir_dirty(work, state) is True
-  res = da.audit_workdir(work, state)
-  assert res["outcome"] == "pass", res["findings"]
-  assert untouched_path.read_bytes() == untouched_before
+    py_mod = f"import openpyxl; wb=openpyxl.load_workbook({str(edit_path)!r}); wb['Inputs']['B1']=250.0; wb.save({str(edit_path)!r})"
 
-  wb_v = openpyxl.load_workbook(edit_path, data_only=True)
-  try:
-    assert wb_v["Calcs"]["C1"].value == 46342
-    assert wb_v["Calcs"]["C2"].value in ("", None)
-    assert abs(float(wb_v["Calcs"]["C3"].value) - 50.0) < 1e-6
-    assert wb_v["Calcs"]["C4"].value == 1
-  finally:
-    wb_v.close()
+    async def _edit_h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+      if n == 1:
+        return (200, "text/event-stream", _sse_tool_call_reply("b1", "bash", {"command": f"python3 -c {shlex.quote(py_mod)}"}))
+      return (200, "text/event-stream", _sse_text_reply("Updated editable.xlsx input load."))
+
+    _, _, edit_rollup = await _run_audit_ws(
+      _edit_h,
+      work,
+      instruction="Update editable.xlsx input load.",
+      env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"},
+      exec_path=no_soffice_path,
+    )
+    assert edit_rollup["audit_outcome"] == "pass"
+    assert untouched_path.read_bytes() == untouched_before
+
+    wb_v = openpyxl.load_workbook(edit_path, data_only=True)
+    try:
+      assert wb_v["Calcs"]["C1"].value == 46342
+      assert wb_v["Calcs"]["C2"].value in ("", None)
+      assert abs(float(wb_v["Calcs"]["C3"].value) - 50.0) < 1e-6
+      assert wb_v["Calcs"]["C4"].value == 1
+    finally:
+      wb_v.close()
+
+  asyncio.run(asyncio.wait_for(_scenario(), timeout=8.0))
 
 
 def test_multi_root_sibling_deliverables_and_small_facts_tolerance(tmp_path: Path) -> None:
-  da = _load_repo_module("deliverable_audit")
   work = tmp_path / "work"
   fs_root = tmp_path / "filesystem_sim"
-  state = tmp_path / "state"
   work.mkdir()
   fs_root.mkdir()
+  no_soffice_path = _path_without_soffice(tmp_path)
 
-  ref_xlsx = fs_root / "baseline_ref.xlsx"
+  ref_xlsx = work / "baseline_ref.xlsx"
   wb_r = xlsxwriter.Workbook(str(ref_xlsx))
   ws_r = wb_r.add_worksheet("Sheet1")
   ws_r.write_formula("A1", "=NOW()", None, 46342.5)
   wb_r.close()
   ref_bytes = ref_xlsx.read_bytes()
 
-  da.snapshot_workdir(work, state, extra_roots=[fs_root, fs_root])
-  assert da.is_workdir_dirty(work, state, extra_roots=[fs_root]) is False
-
-  out_xlsx = fs_root / "deliverable.xlsx"
-  wb_o = openpyxl.load_workbook(ref_xlsx)
-  wb_o["Sheet1"]["A1"] = "=15+15"
-  wb_o["Sheet1"]["A2"] = "strain_ratio = 0.0040"
-  wb_o.save(out_xlsx)
-  wb_o.close()
-
-  (state / "facts.json").write_text(json.dumps({"sum_val": 30.0, "strain_ratio": 0.019}), encoding="utf-8")
-  assert da.is_workdir_dirty(work, state, extra_roots=[fs_root]) is True
-
-  bad_res = da.audit_workdir(
-    work,
-    state,
-    delivered_paths=[str(out_xlsx), "/tmp/.ple_work_fake123/scratch.xlsx", str(state / "init.json")],
-    extra_roots=[fs_root],
-  )
-  assert ref_xlsx.read_bytes() == ref_bytes
-  assert bad_res["outcome"] == "flagged"
-  assert any("strain_ratio" in f for f in bad_res["findings"])
-
-  (state / "facts.json").write_text(json.dumps({"sum_val": 30.0, "strain_ratio": 0.004}), encoding="utf-8")
-  ok_res = da.audit_workdir(work, state, delivered_paths=[str(out_xlsx)], extra_roots=[fs_root])
-  assert ok_res["outcome"] == "pass", ok_res["findings"]
-  wb_check = openpyxl.load_workbook(out_xlsx, data_only=True)
-  try:
-    assert wb_check["Sheet1"]["A1"].value == 30
-  finally:
-    wb_check.close()
-
-
-def test_audit_error_resilience_finish_reaudit_and_opt_latch_across_verifier() -> None:
-  taskbridge, harness = _load_repo_module("taskbridge"), _load_repo_module("harness")
+  out_xlsx = work / "deliverable.xlsx"
+  sibling_md = fs_root / "sibling_report.md"
 
   async def _scenario() -> None:
-    logs: list[str] = []
-    exec_calls: list[str] = []
+    py_bad = (
+      f"import json, os, openpyxl; wb=openpyxl.load_workbook({str(ref_xlsx)!r}); "
+      "wb['Sheet1']['A1']='=15+15'; wb['Sheet1']['A2']='strain_ratio = 0.0040'; "
+      f"wb.save({str(out_xlsx)!r}); "
+      "open(os.environ['PLE_WORK_DIR']+'/facts.json','w').write(json.dumps({'sum_val': 30.0, 'strain_ratio': 0.019}))"
+    )
+    py_fix = "import json, os; open(os.environ['PLE_WORK_DIR']+'/facts.json','w').write(json.dumps({'sum_val': 30.0, 'strain_ratio': 0.004}))"
 
-    class _StubSession:
-      def __init__(self, left_val: float | None = 120.0):
-        self.workdir = "/workspace"
-        self.instruction = "Size steel pipe diameter to minimize total capital cost."
-        self.limits: dict[str, Any] = {"exec_timeout_sec": 60}
-        self.mcp_servers: list[dict[str, Any]] = []
-        self.final_message = ""
-        self.cancelled = asyncio.Event()
-        self._left = left_val
+    async def _h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+      if n == 1:
+        return (200, "text/event-stream", _sse_reply(calls=[
+          ("b1", "bash", {"command": f"python3 -c {shlex.quote(py_bad)}"}),
+          ("w1", "write_file", {"path": str(sibling_md), "content": "sum_val = 30.0\nstrain_ratio = 0.0040\n"}),
+        ], finish_reason="tool_calls"))
+      if n == 2:
+        return (200, "text/event-stream", _sse_text_reply("Initial multi-root summary"))
+      if n == 3:
+        return (200, "text/event-stream", _sse_tool_call_reply("b2", "bash", {"command": f"python3 -c {shlex.quote(py_fix)}"}))
+      return (200, "text/event-stream", _sse_text_reply("Aligned facts.json summary"))
 
-      def time_left(self) -> float | None:
-        return self._left
-
-      async def log(self, text: str) -> None:
-        logs.append(text)
-
-      async def usage(self, *_a: Any, **_kw: Any) -> None:
-        return None
-
-      async def write_file(self, _path: str, data: bytes, append: bool = False) -> int:
-        _ = append
-        return len(data)
-
-      async def exec(self, command: str, timeout_sec: int = 120) -> dict[str, Any]:
-        _ = timeout_sec
-        exec_calls.append(command)
-        if "os.replace" in command:
-          return {"ok": True, "exit_code": 0, "output": "", "timed_out": False}
-        if "sleep_timeout_sim" in command:
-          return {"ok": True, "exit_code": 124, "output": "partial", "timed_out": True}
-        if "assert False" in command:
-          return {"ok": True, "exit_code": 1, "output": "AssertionError", "timed_out": False}
-        if len(exec_calls) == 1:
-          return {"ok": True, "exit_code": 1, "output": "no marker", "timed_out": False}
-        return {"ok": True, "exit_code": 0, "output": "__PLE_AUDIT_JSON__:{not-valid-json", "timed_out": False}
-
-    sess = _StubSession(left_val=400.0)
-    ag = harness.Agent(sess)
+    _, reqs, rollup = await _run_audit_ws(
+      _h,
+      work,
+      instruction="Generate deliverable.xlsx and external sibling_report.md aligned with facts.json.",
+      env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"},
+      exec_path=no_soffice_path,
+    )
+    assert len(reqs) == 4
+    repair_msg = reqs[2]["json"]["messages"][-1]["content"]
+    assert "strain_ratio" in repair_msg and "sibling_report.md" in repair_msg
+    assert ref_xlsx.read_bytes() == ref_bytes
+    assert rollup["audit_outcome"] == "pass"
+    wb_check = openpyxl.load_workbook(out_xlsx, data_only=True)
     try:
-      f1 = await ag.audit_deliverables()
-      assert f1 == [] and ag.audit_outcome == "error" and ag._audit_staged is False
-      f2 = await ag.audit_deliverables()
-      assert f2 == [] and ag.audit_outcome == "error" and ag._audit_staged is True
-      assert any("[PLE_AUDIT] error" in lg for lg in logs)
-
-      # Pure text without deliverables must NOT enter optimization rounds
-      with _env_scope(PLE_ENABLE_VERIFIER="0"):
-        assert await ag._post_completion_gate("No files produced") is None
-        assert ag.opt_rounds == 0
-
-      # Failing inline assert must NOT set _has_self_checked_opt; timed_out bash marks dirty
-      await ag.bash("python3 -c 'assert False'")
-      assert ag._has_self_checked_opt is False
-      await ag.bash("sleep_timeout_sim")
-      assert ag._workdir_dirty is True and ag._needs_reaudit is True
-
-      # write_file on .py containing 'assert ' sets _has_self_checked_opt, and _opt_converged latches across verifier
-      await ag.write_file("opt_check.py", "x = 2\nassert x > 0\n")
-      assert ag._has_self_checked_opt is True
-
-      async def _fake_audit() -> list[str]:
-        ag._needs_reaudit = False
-        ag.audit_outcome = "pass"
-        return []
-
-      async def _fake_verifier(_txt: str) -> str:
-        ag.verifier_runs += 1
-        return "VERIFIER_FAIL: 1. Add units"
-
-      ag.audit_deliverables = _fake_audit  # type: ignore[method-assign]
-      ag.run_verifier = _fake_verifier  # type: ignore[method-assign]
-      with _env_scope(PLE_ENABLE_VERIFIER="1"):
-        gate1 = await ag._post_completion_gate("OPTIMIZATION_CONVERGED: optimal diameter 0.20 m")
-        assert gate1 is not None and "VERIFIER" in gate1 and ag._opt_converged is True and ag.opt_rounds == 0
-        # Subsequent post-verifier summary without repeating OPTIMIZATION_CONVERGED stays converged
-        gate2 = await ag._post_completion_gate("Added SI units to summary.")
-        assert gate2 is None and ag.opt_rounds == 0
-
-      # finish() runs audit_deliverables when _needs_reaudit is True and left > 60
-      finish_audited = False
-
-      async def _track_audit() -> list[str]:
-        nonlocal finish_audited
-        finish_audited = True
-        ag._needs_reaudit = False
-        return []
-
-      async def _stub_complete(**_kw: Any) -> Any:
-        r = harness.Reply()
-        r.text = "Wrap-up summary"
-        r.finish = "stop"
-        return r
-
-      ag._needs_reaudit = True
-      ag.audit_deliverables = _track_audit  # type: ignore[method-assign]
-      ag.complete = _stub_complete  # type: ignore[method-assign]
-      fin_txt = await ag.finish("Time is almost up.")
-      assert finish_audited is True and "Wrap-up summary" in fin_txt
+      assert wb_check["Sheet1"]["A1"].value == 30
     finally:
-      await ag.close()
+      wb_check.close()
 
-  asyncio.run(asyncio.wait_for(_scenario(), timeout=5.0))
+  asyncio.run(asyncio.wait_for(_scenario(), timeout=8.0))
+
+
+def test_audit_error_resilience_finish_reaudit_and_opt_latch_across_verifier(tmp_path: Path) -> None:
+  async def _scenario() -> None:
+    # 1. Corrupt audit JSON output over WebSocket exec_result does not crash session
+    def _corrupt_audit_exec(cmd: str, _idx: int) -> dict[str, Any] | None:
+      if "deliverable_audit.py" in cmd and " audit " in cmd:
+        return {"ok": True, "exit_code": 0, "output": "__PLE_AUDIT_JSON__:{not-valid-json", "timed_out": False}
+      return None
+
+    async def _err_h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+      if n == 1:
+        return (200, "text/event-stream", _sse_tool_call_reply("w1", "write_file", {"path": "out.txt", "content": "ok\n"}))
+      return (200, "text/event-stream", _sse_text_reply("Summary despite audit error."))
+
+    err_frames, _, err_rollup = await _run_audit_ws(
+      _err_h,
+      tmp_path / "err_audit",
+      instruction="Write out.txt.",
+      env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"},
+      exec_override=_corrupt_audit_exec,
+    )
+    err_logs = [str(f.get("text", "")) for f in err_frames if f.get("type") == "log"]
+    assert err_rollup["audit_outcome"] == "error" and any("[PLE_AUDIT] error" in lg for lg in err_logs)
+
+    # 2. Failing bash assert does not satisfy self-check, write_file assert does, and _opt_converged latches across VERIFIER
+    async def _latch_h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+      if n == 1:
+        return (200, "text/event-stream", _sse_reply(calls=[
+          ("b1", "bash", {"command": "python3 -c 'assert False'"}),
+          ("w1", "write_file", {"path": "opt_check.py", "content": "x = 2\nassert x > 0\n"}),
+        ], finish_reason="tool_calls"))
+      if n == 2:
+        return (200, "text/event-stream", _sse_text_reply("OPTIMIZATION_CONVERGED: optimal diameter 0.20 m"))
+      if n == 3:
+        return (200, "text/event-stream", _sse_text_reply("VERIFIER_FAIL: 1. Add SI units"))
+      return (200, "text/event-stream", _sse_text_reply("Added SI units to summary (0.20 m)."))
+
+    _, latch_reqs, latch_rollup = await _run_audit_ws(
+      _latch_h,
+      tmp_path / "opt_latch",
+      instruction="Size steel pipe diameter to minimize total capital cost.",
+      env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "1"},
+    )
+    assert len(latch_reqs) == 4
+    assert latch_rollup["verifier_runs"] == 1 and latch_rollup["opt_rounds"] == 0
+
+    # 3. Timed-out bash marks workdir dirty and finish() runs re-audit when 60 < time_left <= 180
+    def _timeout_bash_exec(cmd: str, _idx: int) -> dict[str, Any] | None:
+      if "sleep_timeout_sim" in cmd:
+        return {"ok": True, "exit_code": 124, "output": "partial", "timed_out": True}
+      return None
+
+    async def _fin_h(_req: dict[str, Any], n: int) -> tuple[int, str, bytes]:
+      if n == 1:
+        return (200, "text/event-stream", _sse_tool_call_reply("b1", "bash", {"command": "sleep_timeout_sim"}))
+      return (200, "text/event-stream", _sse_text_reply("Wrap-up summary after timeout."))
+
+    fin_frames, _, _ = await _run_audit_ws(
+      _fin_h,
+      tmp_path / "finish_audit",
+      instruction="Run analysis before deadline.",
+      env={"MODEL_API_KEY": "stub-k", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"},
+      limits={"agent_timeout_sec": 120},
+      exec_override=_timeout_bash_exec,
+    )
+    fin_logs = [str(f.get("text", "")) for f in fin_frames if f.get("type") == "log"]
+    assert "Wrap-up summary after timeout." in str(fin_frames[-1].get("final_message", ""))
+    assert any("[PLE_AUDIT]" in lg for lg in fin_logs)
+
+  asyncio.run(asyncio.wait_for(_scenario(), timeout=8.0))
 
 
 @settings(max_examples=12, deadline=None)
@@ -586,7 +524,7 @@ def test_pbt_p3_ooxml_cached_values_and_error_flagging_guardian(
 
   frames, _, rollup = asyncio.run(asyncio.wait_for(_run_audit_ws(
     _h, workdir, instruction="Update book.xlsx cells.",
-    env={"MODEL_API_KEY": "stub-p3", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_DISABLE_SOFFICE": "1", "PLE_ENABLE_VERIFIER": "0"},
+    env={"MODEL_API_KEY": "stub-p3", "MODEL_NAME": "google-cloud/glm-5.2", "PLE_ENABLE_VERIFIER": "0"},
     exec_path=_path_without_soffice(workdir),
   ), timeout=8.0))
   exp_f = {("Summary", "B1"): "BETA.DIST", ("Summary", "B2"): "ROUND", ("Summary", "B3"): "SUM"}
