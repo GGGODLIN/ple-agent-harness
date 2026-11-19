@@ -13,7 +13,7 @@
 # limitations under the License.
 
 name: ple-clausegate-mirrorir
-model_api: google-cloud/glm-5.2
+model_api: google-cloud/gemini-4-argon
 install: >-
   if sh -c 'uv --version' >/dev/null 2>&1; then
   uv venv --python 3.12 /opt/harness/venv
