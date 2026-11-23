@@ -566,3 +566,52 @@ def test_oracle_calibration_rejects_individual_bad_states(tmp_path: Path) -> Non
   assert p4_leak_rollup is False, "secret in rollup must fail"
   p4_leak_done = evaluate_p4_oracle([*good_frames[:-1], {"type": "done", "final_message": f"ans {fake_secret}"}], fake_secret)
   assert p4_leak_done is False, "secret in done frame must fail"
+
+
+def test_gemini_default_output_ceiling_65536(tmp_path: Path) -> None:
+  harness_mod = _load_repo_module("harness")
+  assert harness_mod.resolve_default_output_tokens("google-cloud/gemini-4-argon") == 65536
+  assert harness_mod.resolve_default_output_tokens("google-cloud/glm-5.2") == 32000
+  assert harness_mod.resolve_default_output_tokens("google-cloud/gemini-4-argon", "16000") == 16000
+
+  async def _h(_req: dict[str, Any], _n: int) -> tuple[int, str, bytes]:
+    return (200, "text/event-stream", _sse_text_reply("ok"))
+
+  frames, _, reqs = asyncio.run(
+      asyncio.wait_for(
+          _run_stub(
+              _h,
+              tmp_path,
+              env={"MODEL_API_KEY": "stub-argon", "MODEL_NAME": "google-cloud/gemini-4-argon"},
+          ),
+          timeout=5.0,
+      )
+  )
+  assert len(reqs) == 1
+  assert reqs[0]["json"].get("max_completion_tokens") == 65536
+  assert any(f.get("type") == "done" for f in frames)
+
+
+def test_stream_chunk_with_none_delta_does_not_crash(tmp_path: Path) -> None:
+  chunks = [
+      {"id": "c1", "object": "chat.completion.chunk", "model": "google-cloud/gemini-4-argon", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}, "finish_reason": None}]},
+      {"id": "c1", "object": "chat.completion.chunk", "model": "google-cloud/gemini-4-argon", "choices": [{"index": 0, "delta": None, "finish_reason": "stop"}], "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}},
+  ]
+  body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode("utf-8") + b"data: [DONE]\n\n"
+
+  async def _h(_req: dict[str, Any], _n: int) -> tuple[int, str, bytes]:
+    return (200, "text/event-stream", body)
+
+  frames, _, _ = asyncio.run(
+      asyncio.wait_for(
+          _run_stub(
+              _h,
+              tmp_path,
+              env={"MODEL_API_KEY": "stub-none-delta", "MODEL_NAME": "google-cloud/gemini-4-argon"},
+              no_retry=True,
+          ),
+          timeout=5.0,
+      )
+  )
+  assert any(f.get("type") == "done" for f in frames)
+

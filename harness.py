@@ -120,6 +120,18 @@ def resolve_reasoning_effort(
   return "high"
 
 
+def resolve_default_output_tokens(
+    model_name: str, configured_max: str | None = None
+) -> int:
+  """Resolves default output ceiling; Gemini models need 65536 to avoid reasoning truncation."""
+  configured = (configured_max or "").strip()
+  if configured:
+    return int(configured)
+  if "gemini" in (model_name or "").lower():
+    return 65536
+  return 32000
+
+
 def _collect_secret_values() -> list[str]:
   """Collects active credential strings from environment variables and URLs."""
   found: set[str] = set()
@@ -1039,7 +1051,9 @@ class Agent:
     # Each call asks for output_limit(): output_ceiling (MAX_OUTPUT_TOKENS,
     # lowered by shrink_output when the endpoint refuses that many), or less
     # when the context window has less room beside the prompt.
-    self.output_ceiling = int(os.environ.get("MAX_OUTPUT_TOKENS", "32000"))
+    self.output_ceiling = resolve_default_output_tokens(
+        self.model, os.environ.get("MAX_OUTPUT_TOKENS")
+    )
     self.context_window: int | None = None  # learned from a context-full error
     self.max_output = self.output_ceiling  # the limit the last call asked for
     # max_tokens once an endpoint refuses this one
@@ -1697,8 +1711,11 @@ class Agent:
         reply.usage = chunk.usage or reply.usage
         if not chunk.choices:
           continue
-        delta = chunk.choices[0].delta
-        reply.finish = chunk.choices[0].finish_reason or reply.finish
+        choice = chunk.choices[0]
+        reply.finish = choice.finish_reason or reply.finish
+        delta = choice.delta
+        if delta is None:
+          continue
         reply.text += delta.content or ""
         reply.reasoning += (
             getattr(delta, "reasoning_content", None)
