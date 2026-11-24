@@ -1,0 +1,53 @@
+I have completed the review of Northline Renewables LLC's pre-application request dated `07/02/2025` (`2025-07-02_PreApp_Request_ALN-108.pdf`) for the proposed `3.0 MW` (`3.0 MW-AC` / `~3.9 MW-DC`) pure-generation `Elderpine Solar I` project on Feeder `ALN-108` (`Elderpine` substation, `13.2 kV`), reconciled it against the DER Program records as of `07/14/2025` (`2025-07-14_Active_Queue_Report.xlsx`, `2025-07-14_On_Hold_Queue_Report.xlsx`, `Hosting_Capacity_Map_Export_2024-05-15.xlsx` [`HCM-2024-Q2`], `2024-10-15_ALN-108_Planning_Study.docx` [`PLN-ALN-108-2024-10`], `RA-2025-07-01 §3.7`, and the governing tariff and technical standards), issued and filed the Program Office's written response, and recorded the determinations, required follow-up actions, and case closure in the Program Office's case tracking system.
+
+---
+
+### Deliverables & Case Tracking Updates
+
+1. **Primary Word Document Deliverable:**
+   * `/filesystem/ALN-108_PreApplication_Response.docx` (also mirrored locally at `/filesystem/Correspondence/ALN-108_PreApplication_Response.docx`)
+2. **Document Store (Nextcloud) Correspondence Filing:**
+   * `/DER_Program/Correspondence/ALN-108_PreApplication_Response.docx` (`Doc no. DER-CORR-ALN-108-2025-07-14`, Rev 1, dated `07/14/2025`)
+3. **Program Office Case Tracking (OpenProject — Project `#3: DER Program Backlog Review`, Work Package `#44: Respond to the Feeder ALN-108 pre-application request`):**
+   * Recorded the call on Northline Renewables' pre-application request, logged all required follow-up actions (in both the Work Package `#44` activity log comment [Activity `#59`] and the Work Package `#44` description), and closed the case (`status: "Closed"`, `done_ratio: 100%`).
+
+---
+
+### Summary of Determinations, Basis Relied Upon, and Calls Made
+
+#### 1. Call on Request Item 1 — Written Confirmation of Available Capacity on Feeder `ALN-108`
+* **Call:** **NOT CONFIRMED / DENIED as to `3.0 MW` availability; CONFIRMED at `0.8 MW` (`800 kW`) current working interim netted available capacity as of `07/14/2025` (a `2.2 MW` [`2,200 kW`] shortfall against Northline's `3.0 MW` request).**
+* **Basis & Capacity Reconciliation:**
+  * **Published Map Baseline (`HCM-2024-Q2`, published `05/15/2024`, Last Study Date `04/2024`):** **`3.0 MW`** (`3,000 kW`) on Feeder `ALN-108` (`Elderpine` substation, `13.2 kV`, `Pure Generation`). Under the `HCM-2024-Q2` Title Block (Applicability), published figures reflect available capacity only as of `05/15/2024` and a pre-application capacity response is prepared against the published value as adjusted for queue entries added since publication.
+  * **Pre-Publication Active Queue Entries on `ALN-108` (`2025-07-14_Active_Queue_Report.xlsx`, already accounted for in the `04/2024` study / `05/15/2024` `3.0 MW` baseline):**
+    1. **`PXA-2023-0894`** — `Ravenford Data Services` (`Ravenford Campus Rooftop PV`), **`1.1 MW`** (`1,100 kW`), Queue Date: **`11/20/2023`**, Status: **`ISA executed`**
+    2. **`PXA-2024-0091`** — `Fenwyn Industries Corp` (`Fenwyn Facility 3 Array`), **`690 kW`** (`0.69 MW`), Queue Date: **`04/03/2024`**, Status: **`construction`**
+    * *Pre-Publication Active Queue Subtotal:* **`1.79 MW`** (`1,790 kW`).
+  * **Post-Publication Queue Addition #1 & Q3 2024 Interim Study (`PLN-ALN-108-2024-10`, dated `10/15/2024`):**
+    3. **`PXA-2024-0231`** — `Grantwyck Solar LLC` (`Grantwyck ALN-108 Field Solar`, Pure Generation), **`1.2 MW`** (`1,200 kW`), Queue Date: **`09/18/2024`**, Status: **`system impact study`**. Netted in `PLN-ALN-108-2024-10` (`10/15/2024`) to reduce interim available capacity from `3.0 MW` to **`1.8 MW`** (`1,800 kW`).
+  * **Post-Publication Queue Addition #2 (Queued Subsequent to `10/15/2024`; Identified in `2025-07-14_Active_Queue_Report.xlsx`):**
+    4. **`PXA-2025-0044`** — `Cindermere Renewables LLC` (`Cindermere Feeder Site A`), **`1.0 MW`** (`1,000 kW`), Queue Date: **`02/06/2025`**, Status: **`technical screening`**.
+    * *Post-Publication Active Queue Subtotal:* **`2.2 MW`** (`2,200 kW`) (`1.2 MW + 1.0 MW`).
+    * *Total Active Queue on Feeder `ALN-108` as of `07/14/2025`:* **4 active projects totaling `3.99 MW` (`3,990 kW`)** (`0` on-hold applications in `2025-07-14_On_Hold_Queue_Report.xlsx`; `0` pending withdrawals in `Withdrawal_Notice_Log.xlsx`).
+  * **Current Working Interim Netted Available Capacity (`07/14/2025`):**
+    $$3.0\text{ MW (Published 05/15/2024)} - 1.2\text{ MW (PXA-2024-0231, 09/18/2024)} - 1.0\text{ MW (PXA-2025-0044, 02/06/2025)} = \mathbf{0.8\text{ MW}}\ (\mathbf{800\text{ kW}})$$
+
+#### 2. Call on Request Item 2 — Conditions, Restrictions, Upgrade Indications & Project Scoping Options
+* **Call:** **Issued three project scoping paths and five mandatory technical/tariff conditions:**
+  * **Option A — Re-Scope / Control `Elderpine Solar I` to `<= 0.8 MW` (`800 kW` AC) on Feeder `ALN-108`:** Either reduce physical inverter nameplate to `<= 800 kW` (`DIS-01 Rev 4 §3.1`) or establish a recognized controlled export limit of `<= 800 kW` under **`DIS-01 Rev 4 §3.6`** by submitting both (1) a valid **UL 1741 / UL 3141 Power Control System (PCS) certification** and (2) an approved **Control Narrative** (enforced on a pure-generation site via `TCS-02` SCADA telemetry monitoring and the utility POI recloser's **ANSI 32 directional-power element** set to trip on violation). At `800 kW` (`500 kW – 1 MW` band), the project qualifies as Commercial Small-Scale DER (`Tariff §12.2(a)`, `DIS-01 §3 Table 3-1` Category 2) eligible for `SRP-3 Rev 3` screening/supplemental review (including Screen D's `100%`-of-minimum-load screen evaluated on the `10:00–16:00` daytime AMI interval window per `SRP-3 Rev 3 §4`).
+  * **Option B — Proceed at `3.0 MW-AC` on Feeder `ALN-108` (`2.2 MW` Over-Subscribed):** Sits in strict queue order (`Tariff §12.3` & `§12.7`) behind `PXA-2023-0894`, `PXA-2024-0091`, `PXA-2024-0231`, and `PXA-2025-0044`; classified as Medium-Scale DER (`1–5 MW`, `Tariff §12.2(b)`, `DIS-01 §3 Table 3-1` Category 3) requiring a mandatory **System Impact Study (SIS)** and full feeder re-study, with a `2.2 MW` exceedance expected to fail thermal, voltage/flicker, protection/short-circuit, daytime minimum-load, and/or substation reverse-power screens and require customer-funded system upgrades unless senior queue entries withdraw or downsize.
+  * **Option C — Evaluate Alternative Elderpine Substation `13.2 kV` Pure-Generation Feeders (`ALN-097` or `ALN-103`):** Adjacent Elderpine `13.2 kV` Pure-Generation feeders **`ALN-097`** (**`6.1 MW`** published available capacity on `HCM-2024-Q2`) and **`ALN-103`** (**`5.5 MW`** published available capacity on `HCM-2024-Q2`) have **`0 MW`** active or on-hold queue entries as of `07/14/2025`. POI and capacity selection must be finalized before ISA execution (`Tariff §12.6`, `DIS-01 Rev 4 §7`).
+  * **Mandatory Technical & Equipment Lead-Time Conditions:**
+    1. *Certified Equipment List:* Inverters (and any PCS) must appear on **`CEL-2025-Q2`** (effective `04/30/2025`, superseding `CEL-2024-Q4`; required for witness-test waiver eligibility).
+    2. *Protection & Utility-Owned POI Recloser:* Required at `3.0 MW` (`DIS-01 Table 5-1` Category 3 & `DPS-07 §4.2`) and also required if resized to `500 kW – 1 MW` pure-export (`DPS-07 §4.2`, `ERP-9 §3` / `EB-2025-03` Precedents `ER-11-2025-004` & `ER-11-2025-009`), implementing ANSI `50/51`, `50N/51N`, `27/59`, `81U/81O`, `25`, `32`, and `79`, plus customer lockable visible-break disconnect and dedicated relay scheme.
+    3. *Utility-Owned RTU & No-Telemetry-No-PTO Rule:* Requires a utility-owned RTU (`YOT-8963`, `YOT-8856`, or `YOT-7963`; Northline's plant-level SCADA controller interfaces via DNP3 on the plant side but does not substitute for the utility RTU per `TCS-02 §3.2`), dedicated AC station service with a 4-hour UPS (`TCS-02 §3.4`), utility-managed DNP3 comms (`TCS-02 §4.1`, `§6.2`), and end-to-end commissioned live telemetry confirmed by the SOC Shift Supervisor prior to PTO (`TCS-02 §5`).
+    4. *Equipment Lead Time (`~8 Months`) & `OG-17` Sequencing:* Approved suppliers (`Kelvraith Grid Systems, Inc.` for RTUs; `Norstead Power Controls, LLC` for POI reclosers) quote an **`~8-month` lead time** from PO acknowledgement (`SCADA-EQP-2025-06`, with current deliveries in `08/2025` and `03/2026`), and constrained equipment is deployed under **`OG-17 Rev 1`** criticality criteria (`Tariff §12.7` Scope Note).
+
+#### 3. Call on Request Item 3 — Pre-Application Dialogue Meeting
+* **Call:** **APPROVED / GRANTED.** Pre-application dialogue meeting offered with `June Halloway` (Distribution Planning Engineer), `Meera Vellanki` (Manager, Interconnection Studies), and `Ivo Grantham` (Manager, DER Planning Group).
+
+#### 4. Call on Map Maintenance & Follow-Up Logged in Case Tracking (`Work Package #44` / `RA-2025-07-01 §3.7`)
+* **Call:** **FLAGGED, LOGGED & CASE CLOSED (`100%`).**
+  1. **Reissue / Supersede Interim Study `PLN-ALN-108-2024-10` (`10/15/2024`):** Logged for `June Halloway` (Distribution Planning) per `PLN-ALN-108-2024-10 §5` to incorporate `PXA-2025-0044` (`1.0 MW`, queued `02/06/2025`) alongside `PXA-2024-0231` (`1.2 MW`, queued `09/18/2024`) and update the working interim netted capacity from `1.8 MW` to **`0.8 MW` (`800 kW`)**.
+  2. **Priority Hosting Capacity Map Refresh & Full Feeder `ALN-108` Re-Study (`RA-2025-07-01 §3.7` & `HCM-2024-Q2`):** Flagged that `HCM-2024-Q2` (`05/15/2024`) is overdue on its quarterly refresh commitment by over four quarters and requested a priority refresh and full feeder re-study under all three `HCM-2024-Q2` refresh prioritization criteria: (i) **Application / Pre-Application Date** (`09/18/2024`, `02/06/2025`, and `07/02/2025` against a `04/2024` study), (ii) **Capacity Requested Relative to Published Available Figure** (`2.2 MW` queued post-publication = `73.33%` of `3.0 MW` published baseline; `3.0 MW` requested = `100.0%` of baseline and `375.0%` of remaining `0.8 MW` interim capacity; `5.2 MW` combined = `173.33%` of baseline), and (iii) **DER Category Weighting** (`Pure Generation` carries highest weighting against feeder headroom).
+  3. **Pre-Application Dialogue & Regulatory Reporting:** Logged pre-application dialogue meeting with `Northline Renewables LLC` (`Peter Ashford`) and regulatory reporting for the `08/15/2025` Alleron Municipal League response and `08/22/2025` / `09/10/2025` APUC Docket `APUC-2025-ER-014` (`ERD-IR-2025-07-014` Item 2).

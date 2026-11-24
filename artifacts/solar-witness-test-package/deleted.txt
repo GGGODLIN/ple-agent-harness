@@ -1,0 +1,11 @@
+/app/tools/.apps_data/nextcloud_browser/File.csv
+/app/tools/.apps_data/nextcloud_browser/Folder.csv
+/app/tools/.apps_data/nextcloud_browser/Group.csv
+/app/tools/.apps_data/nextcloud_browser/GroupMembership.csv
+/app/tools/.apps_data/nextcloud_browser/Share.csv
+/app/tools/.apps_data/nextcloud_browser/User.csv
+/app/tools/.apps_data/openproject/Membership.csv
+/app/tools/.apps_data/openproject/Project.csv
+/app/tools/.apps_data/openproject/User.csv
+/app/tools/.apps_data/openproject/Version.csv
+/app/tools/.apps_data/openproject/WorkPackage.csv

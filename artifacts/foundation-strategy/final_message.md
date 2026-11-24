@@ -1,0 +1,25 @@
+OPTIMIZATION_CONVERGED
+
+The Phase 1 foundation package for the Cattail Run Data Campus (`CR-P1` through `CR-P6`) has been optimized, verified with nominal-pass and violated-constraint assertions, and atomically packaged in `/filesystem/dc_structural__foundation_strategy__blind/output/submission.zip` (synchronized with `/tmp/.ple_work_67d63b6cbe68/facts.json`).
+
+### Deliverables in `/filesystem/dc_structural__foundation_strategy__blind/output/submission.zip`
+1. **`foundation_geometry.json`** — Revit foundation geometry parameter file conforming to `AV-CR-2604_BIM_parameter_standard.md` (Rev. 2) for all 6 pads and 36 foundations (`F1`–`F5` isolated column footings and `W1` continuous shear-wall footing per pad).
+2. **`ground_improvement_plan.json`** — Ground-improvement programme parameter file detailing the adopted stress concentration ratio (`10.0`), pier diameter (`30 in`), rig mobilisation plan (`2` rigs serving `4` improved pads at `$80,000.00`), verification testing (`1` production modulus test per improved pad), and per-pad stiffness modulus, deepest treatment depth, and total pier linear footage.
+3. **`foundation_schedule.xlsx`** — Complete 36-row foundation schedule on the owner's template (`FOUNDATION SCHEDULE` tab), in exact agreement with `foundation_geometry.json`.
+4. **`foundation_feasibility_matrix.md`** — Pad-by-pad and foundation-by-foundation feasibility and optimization matrix reporting demands, three-method bearing capacity checks (`Vesic`/`UFC 3-220-20`, `Meyerhof`, `Hansen`), layered elastic total and differential settlements, shear-wall lateral/overturning/uplift stability checks, governing constraints, and itemised costs of both `SPREAD` and `IMPROVED_SPREAD` alternatives.
+5. **`constraint_register.xlsx`** — 64-row constraint register on the owner's template (`CONSTRAINT REGISTER` tab, within the 96-row scoring window) registering all governing requirement families with exact document filenames, clauses, tables, and equations, and explicitly recording cancelled, superseded, and inapplicable documents as set aside in the `resolution` column.
+6. **`design_basis.md`** — Design basis report opening with the required fenced ` ```json ` summary block followed by the engineering narrative covering governing vs. rejected criteria, bearing and settlement procedures, tolerable movement limits, aggregate-pier design parameters, document conflict resolutions, and campus-wide rig and pad optimization.
+
+---
+
+### Key Engineering & Optimization Results
+
+* **Frost Protection & Bearing Depth (`LC-BD-26-0774` Amendment 3, `RFI-007`):** At county station of record `USC00444909` (`LINCOLN`, VA), the current `1981-2010` NOAA NCEI 100-year return-period air-freezing index is **`556 °F-days`** (`> 500 °F-days`), superseding the `1951-1980` value of `416 °F-days` and requiring a minimum frost embedment of **`42 in`** (`3.50 ft`). All selected foundations across `CR-P1`–`CR-P6` are founded at $D_f = 42\text{ in}$ (`dewatering_days = 0`).
+* **Campus Ground-Improvement Strategy (`total_cost_usd = $390,033.32`):**
+  * **`CR-P1` (Data Hall 1):** `IMPROVED_SPREAD` (`FS = 3.5`, `S1`, $f'_c = 4,000\text{ psi}$, $\text{w/cm} \le 0.50$, $k_g = 165\text{ pci}$, deepest treatment depth `9 ft`, `669.0 LF` piers), governing constraint `BEARING` — **`$72,282.07`** (vs. `$134,903.44` for `SPREAD`).
+  * **`CR-P2` (Data Hall 2):** `IMPROVED_SPREAD` (`FS = 3.5`, `S2`, $f'_c = 4,500\text{ psi}$, $\text{w/cm} \le 0.45$, $k_g = 140\text{ pci}$, deepest treatment depth `10 ft`, `687.0 LF` piers), governing constraint `BEARING` — **`$77,075.36`** (vs. `$136,322.13` for `SPREAD`).
+  * **`CR-P3` (Electrical Yard Building):** `SPREAD` (`FS = 3.5`, `S0`, $f'_c = 4,000\text{ psi}$, $\text{w/cm} \le 0.50$), governing constraint `SETTLEMENT` ($s_{\max} = 0.995\text{ in} \le 1.000\text{ in}$) — **`$30,061.33`** (vs. `$48,531.58` for `IMPROVED_SPREAD`).
+  * **`CR-P4` (Administration & Operations Building):** `IMPROVED_SPREAD` (`FS = 3.0`, `S1`, $f'_c = 4,000\text{ psi}$, $\text{w/cm} \le 0.50$, $k_g = 195\text{ pci}$, treatment depth `8 ft`, `360.0 LF` piers), governing constraint `BEARING` — **`$40,576.95`** (vs. `$58,913.93` for `SPREAD`).
+  * **`CR-P5` (Logistics & Spares Warehouse):** `SPREAD` (`FS = 2.5`, `F3`/`S0`, $f'_c = 5,000\text{ psi}$, $\text{w/cm} \le 0.40$), governing constraint `BEARING` ($s_{\max} = 0.867\text{ in} \le 1.000\text{ in}$) — **`$14,992.23`** (vs. `$34,612.14` for `IMPROVED_SPREAD`).
+  * **`CR-P6` (Data Hall 3):** `IMPROVED_SPREAD` (`FS = 3.5`, `S2`, $f'_c = 4,500\text{ psi}$, $\text{w/cm} \le 0.45$, $k_g = 155\text{ pci}$, deepest treatment depth `11 ft`, `678.0 LF` piers), governing constraint `BEARING` — **`$75,045.38`** (vs. `$113,106.63` for `SPREAD`).
+  * **Rig Mobilisation:** **2 rigs** (`RIG-1`: `CR-P1`, `CR-P2`; `RIG-2`: `CR-P4`, `CR-P6`) at `$40,000/rig` = **`$80,000.00`**, bringing the total Phase 1 campus foundation cost to **`$390,033.32`**.
